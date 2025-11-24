@@ -13,15 +13,13 @@ from typing import List, Optional
 from pydantic import BaseModel
 from html import unescape
 
-# --- CONFIGURATION (LOADED FROM GITHUB SECRETS) ---
-# ⚠️ You must set these in GitHub Settings > Secrets
+# --- CONFIGURATION ---
 UPSTOX_ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN")
 INDIANAPI_KEY       = os.getenv("INDIANAPI_KEY")
 GEMINI_API_KEY      = os.getenv("GEMINI_API_KEY")
 TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID")
 
-# Settings
 ACCOUNT_SIZE = 100000
 RISK_PER_TRADE = 0.02
 
@@ -55,7 +53,6 @@ MASTER_MAP = fetch_upstox_map()
 def get_live_price(instrument_key, symbol_fallback=None):
     url = "https://api.upstox.com/v3/market-quote/ltp"
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {UPSTOX_ACCESS_TOKEN}'}
-    
     def try_key(k):
         try:
             res = requests.get(url, params={"instrument_key": k}, headers=headers)
@@ -64,14 +61,11 @@ def get_live_price(instrument_key, symbol_fallback=None):
                 first = next(iter(d['data']))
                 return float(d['data'][first]['last_price'])
         except: return None
-    
     price = try_key(instrument_key)
     if price: return price
-    if symbol_fallback:
-        return try_key(f"NSE_EQ|{symbol_fallback.replace('.NS','').upper()}")
+    if symbol_fallback: return try_key(f"NSE_EQ|{symbol_fallback.replace('.NS','').upper()}")
     return None
 
-# Fixed: Added 'interval' parameter
 def fetch_candles(key, days, interval="days"):
     start = datetime.now().date() - timedelta(days=days)
     url = f"https://api.upstox.com/v3/historical-candle/{key}/{interval}/1/{datetime.now().date()}/{start}"
@@ -83,19 +77,38 @@ def fetch_candles(key, days, interval="days"):
         return sorted([PriceCandle(timestamp=datetime.fromisoformat(i[0].replace('Z','+00:00')), open=i[1], high=i[2], low=i[3], close=i[4], volume=i[5], ticker=key) for i in c], key=lambda x: x.timestamp)
     except: return []
 
+# 🚨 UPDATED: Now calculates ATR (Volatility)
 def get_technicals(candles):
     if not candles or len(candles) < 200: return None
     df = pd.DataFrame([c.model_dump() for c in candles])
     df['close'] = df['close'].astype(float)
+    df['high'] = df['high'].astype(float)
+    df['low'] = df['low'].astype(float)
+    
+    # EMAs
     df['ema_50'] = df['close'].ewm(span=50).mean()
     df['ema_200'] = df['close'].ewm(span=200).mean()
+    
+    # RSI
     delta = df['close'].diff()
     gain = (delta.where(delta>0, 0)).rolling(14).mean()
     loss = (-delta.where(delta<0, 0)).rolling(14).mean()
     df['rsi'] = 100 - (100/(1+(gain/loss)))
+    
+    # ATR Calculation (Volatilty)
+    df['tr1'] = df['high'] - df['low']
+    df['tr2'] = abs(df['high'] - df['close'].shift())
+    df['tr3'] = abs(df['low'] - df['close'].shift())
+    df['tr'] = df[['tr1', 'tr2', 'tr3']].max(axis=1)
+    df['atr'] = df['tr'].rolling(14).mean()
+    
     cur = df.iloc[-1]
-    trend = "UP" if cur['close'] > cur['ema_200'] else "DOWN"
-    return {"rsi": round(cur['rsi'],2), "price": cur['close'], "trend": trend}
+    return {
+        "rsi": round(cur['rsi'],2), 
+        "price": cur['close'], 
+        "atr": round(cur['atr'], 2),  # <--- New Value
+        "trend": "UP" if cur['close'] > cur['ema_200'] else "DOWN"
+    }
 
 def calculate_weekly_trend(candles):
     if not candles or len(candles) < 40: return "UNKNOWN"
@@ -114,8 +127,7 @@ def fetch_funds(name):
 
 def fetch_news(name):
     try:
-        url = f"https://news.google.com/rss/search?q={name}+stock+news+india&hl=en-IN&gl=IN&ceid=IN:en"
-        root = ET.fromstring(requests.get(url).content)
+        root = ET.fromstring(requests.get(f"https://news.google.com/rss/search?q={name}+stock+news+india&hl=en-IN&gl=IN&ceid=IN:en").content)
         return [NewsItem(title=unescape(i.find('title').text), source=i.find('source').text) for i in root.findall('./channel/item')[:3]]
     except: return []
 
@@ -138,7 +150,7 @@ def run_screener(limit=5):
         top_sec = idx_pct.idxmax()
         
         scan_list = sector_universe[top_sec.replace("^CNX","")] if idx_pct.max() > 0.8 and top_sec.replace("^CNX","") in sector_universe else all_stocks
-        print(f"   🎯 Target: {top_sec} (+{idx_pct.max():.2f}%)")
+        print(f"   🎯 Target: {'SECTOR ' + top_sec if idx_pct.max() > 0.8 else 'BROAD MARKET'} ({len(scan_list)} stocks)")
         
         data = yf.download(scan_list, period="20d", progress=False)
         candidates = {}
@@ -181,7 +193,6 @@ def run_bot():
         print(f"🔍 {sym}...")
         
         try:
-            # Fixed: Force 'days' and 'weeks'
             daily = fetch_candles(key, 400, interval="days")
             weekly = fetch_candles(key, 700, interval="weeks")
             if not daily or not weekly: continue
@@ -190,29 +201,37 @@ def run_bot():
             w_trend = calculate_weekly_trend(weekly)
             fund = fetch_funds(sym)
             news = fetch_news(sym)
-            
-            # Fixed: Robust Live Price
             live_price = get_live_price(key, sym) or d_tech['price']
 
             smart_money = (fund.promoter_holding or 0) + (fund.fii_holding or 0)
+            
+            # Pass ATR to Gemini so it knows volatility
             prompt = f"""
             ACT AS: Hedge Fund Manager. ASSET: {sym}
             [TECHNICALS]
             Weekly Trend: {w_trend}. Daily Trend: {d_tech['trend']}. RSI: {d_tech['rsi']}.
+            Daily ATR (Volatility): {d_tech['atr']}
             [FUNDAMENTALS] PE: {fund.pe_ratio}. Smart Money: {smart_money:.2f}%
             [NEWS] {chr(10).join([n.title for n in news])}
             [RULES] BUY if Weekly UP + Daily UP + RSI 40-60.
-            [OUTPUT JSON] {{ "signal": "BUY/WAIT", "confidence": 0-100, "reasoning": "Text", "target": 0, "stop": 0 }}
+            [OUTPUT JSON] {{ "signal": "BUY/WAIT", "confidence": 0-100, "reasoning": "Text" }}
             """
             res = json.loads(model.generate_content(prompt).text.strip().replace("```json","").replace("```",""))
             print(f"   ✅ {res['signal']}")
             
             if res['signal'] == "BUY":
-                qty = 0
-                risk = live_price - res['stop']
-                if risk > 0: qty = int((ACCOUNT_SIZE * RISK_PER_TRADE) / risk)
+                # 🚨 PYTHON MATH: CALCULATE DYNAMIC STOPS (ATR BASED)
+                atr = d_tech['atr']
+                entry = live_price
+                stop_loss = int(entry - (2 * atr)) # Stop is 2x ATR below entry
+                target = int(entry + (4 * atr))    # Target is 4x ATR above (1:2 Ratio)
                 
-                msg = f"🟢 *GEMINI BUY*\n💎 {sym}\nEntry: {live_price}\nTgt: {res['target']} | Stop: {res['stop']}\n📦 Qty: {qty}\n🧠 {res['reasoning'][:200]}"
+                qty = 0
+                risk_per_share = entry - stop_loss
+                if risk_per_share > 0:
+                    qty = int((ACCOUNT_SIZE * RISK_PER_TRADE) / risk_per_share)
+                
+                msg = f"🟢 *GEMINI BUY*\n💎 {sym}\nEntry: {entry}\nTgt: {target} | Stop: {stop_loss}\n(ATR: {atr:.1f})\n📦 *Qty: {qty}*\n🧠 {res['reasoning'][:200]}"
                 requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"})
             
             time.sleep(1.5)
