@@ -12,6 +12,8 @@ from datetime import datetime, timedelta
 from typing import List, Optional
 from pydantic import BaseModel
 from html import unescape
+import gspread
+from google.oauth2.service_account import Credentials
 
 # --- CONFIGURATION ---
 UPSTOX_ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN")
@@ -19,6 +21,8 @@ INDIANAPI_KEY       = os.getenv("INDIANAPI_KEY")
 GEMINI_API_KEY      = os.getenv("GEMINI_API_KEY")
 TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID")
+GDRIVE_JSON         = os.getenv("GDRIVE_CREDENTIALS") # New Secret
+SHEET_NAME          = "GeminiTrader_Logs"
 
 ACCOUNT_SIZE = 100000
 RISK_PER_TRADE = 0.02
@@ -77,25 +81,19 @@ def fetch_candles(key, days, interval="days"):
         return sorted([PriceCandle(timestamp=datetime.fromisoformat(i[0].replace('Z','+00:00')), open=i[1], high=i[2], low=i[3], close=i[4], volume=i[5], ticker=key) for i in c], key=lambda x: x.timestamp)
     except: return []
 
-# 🚨 UPDATED: Now calculates ATR (Volatility)
 def get_technicals(candles):
     if not candles or len(candles) < 200: return None
     df = pd.DataFrame([c.model_dump() for c in candles])
     df['close'] = df['close'].astype(float)
-    df['high'] = df['high'].astype(float)
-    df['low'] = df['low'].astype(float)
-    
-    # EMAs
+    df['high'] = df['high'].astype(float); df['low'] = df['low'].astype(float)
     df['ema_50'] = df['close'].ewm(span=50).mean()
     df['ema_200'] = df['close'].ewm(span=200).mean()
-    
-    # RSI
     delta = df['close'].diff()
     gain = (delta.where(delta>0, 0)).rolling(14).mean()
     loss = (-delta.where(delta<0, 0)).rolling(14).mean()
     df['rsi'] = 100 - (100/(1+(gain/loss)))
     
-    # ATR Calculation (Volatilty)
+    # ATR
     df['tr1'] = df['high'] - df['low']
     df['tr2'] = abs(df['high'] - df['close'].shift())
     df['tr3'] = abs(df['low'] - df['close'].shift())
@@ -103,12 +101,7 @@ def get_technicals(candles):
     df['atr'] = df['tr'].rolling(14).mean()
     
     cur = df.iloc[-1]
-    return {
-        "rsi": round(cur['rsi'],2), 
-        "price": cur['close'], 
-        "atr": round(cur['atr'], 2),  # <--- New Value
-        "trend": "UP" if cur['close'] > cur['ema_200'] else "DOWN"
-    }
+    return {"rsi": round(cur['rsi'],2), "price": cur['close'], "atr": round(cur['atr'],2), "trend": "UP" if cur['close']>cur['ema_200'] else "DOWN"}
 
 def calculate_weekly_trend(candles):
     if not candles or len(candles) < 40: return "UNKNOWN"
@@ -127,7 +120,8 @@ def fetch_funds(name):
 
 def fetch_news(name):
     try:
-        root = ET.fromstring(requests.get(f"https://news.google.com/rss/search?q={name}+stock+news+india&hl=en-IN&gl=IN&ceid=IN:en").content)
+        url = f"https://news.google.com/rss/search?q={name}+stock+news+india&hl=en-IN&gl=IN&ceid=IN:en"
+        root = ET.fromstring(requests.get(url).content)
         return [NewsItem(title=unescape(i.find('title').text), source=i.find('source').text) for i in root.findall('./channel/item')[:3]]
     except: return []
 
@@ -148,9 +142,8 @@ def run_screener(limit=5):
         idx_data = yf.download(list(sector_universe.keys()), period="2d", progress=False)['Close']
         idx_pct = ((idx_data.iloc[-1] - idx_data.iloc[-2]) / idx_data.iloc[-2]) * 100
         top_sec = idx_pct.idxmax()
-        
         scan_list = sector_universe[top_sec.replace("^CNX","")] if idx_pct.max() > 0.8 and top_sec.replace("^CNX","") in sector_universe else all_stocks
-        print(f"   🎯 Target: {'SECTOR ' + top_sec if idx_pct.max() > 0.8 else 'BROAD MARKET'} ({len(scan_list)} stocks)")
+        print(f"   🎯 Target: {top_sec} (+{idx_pct.max():.2f}%)" if idx_pct.max() > 0.8 else "   ⚠️ Market Flat. Scanning Broad.")
         
         data = yf.download(scan_list, period="20d", progress=False)
         candidates = {}
@@ -162,23 +155,36 @@ def run_screener(limit=5):
                 change = ((close.iloc[-1] - close.iloc[-2]) / close.iloc[-2]) * 100
                 if shock > 1.5 and change > 0.2: candidates[s.replace(".NS","")] = shock
             except: continue
-            
         winners = sorted(candidates, key=candidates.get, reverse=True)[:limit]
-        if not winners and len(scan_list)>1: 
-            gains = ((data['Close'].iloc[-1]-data['Close'].iloc[-2])/data['Close'].iloc[-2]*100).sort_values(ascending=False).head(limit)
-            winners = [x.replace(".NS","") for x in gains.index]
+        if not winners:
+            if len(scan_list)>1: 
+                gains = ((data['Close'].iloc[-1]-data['Close'].iloc[-2])/data['Close'].iloc[-2]*100).sort_values(ascending=False).head(limit)
+                winners = [x.replace(".NS","") for x in gains.index]
         print(f"   🚀 Candidates: {winners}")
         return winners
     except: return ["RELIANCE", "TCS"]
 
-# --- TOOL 4: EXECUTION ---
+# --- TOOL 4: LOGGING & EXECUTION ---
+def log_to_sheet(data, qty):
+    if not GDRIVE_JSON: return
+    try:
+        creds = Credentials.from_service_account_info(json.loads(GDRIVE_JSON), scopes=["https://www.googleapis.com/auth/spreadsheets"])
+        gc = gspread.authorize(creds)
+        sh = gc.open(SHEET_NAME).sheet1
+        if not sh.get_all_values(): sh.append_row(["Date", "Ticker", "Signal", "Entry", "Target", "Stop", "Qty", "Reasoning", "Status"])
+        
+        row = [str(datetime.now().date()), data['ticker'], data['signal'], data['entry_price'], data['target_price'], data['stop_loss'], qty, data['reasoning'], "OPEN"]
+        sh.append_row(row)
+        print("   📝 Logged to Cloud Sheet.")
+    except Exception as e: print(f"   ⚠️ Cloud Logging Failed: {e}")
+
 def run_bot():
     print("\n🤖 STARTING CLOUD AGENT...")
     
+    # Market Check
     try:
         mkt = yf.download("^NSEI", period="1y", progress=False)
-        ema200 = mkt['Close'].ewm(span=200).mean().iloc[-1]
-        if mkt['Close'].iloc[-1] < ema200:
+        if mkt['Close'].iloc[-1] < mkt['Close'].ewm(span=200).mean().iloc[-1]:
             requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": "🔴 *MARKET DOWNTREND* - HALTED", "parse_mode": "Markdown"})
             return
     except: pass
@@ -190,8 +196,7 @@ def run_bot():
     for sym in winners:
         key = MASTER_MAP.get(sym)
         if not key: continue
-        print(f"🔍 {sym}...")
-        
+        print(f"\n🔍 {sym}...")
         try:
             daily = fetch_candles(key, 400, interval="days")
             weekly = fetch_candles(key, 700, interval="weeks")
@@ -203,15 +208,10 @@ def run_bot():
             news = fetch_news(sym)
             live_price = get_live_price(key, sym) or d_tech['price']
 
-            smart_money = (fund.promoter_holding or 0) + (fund.fii_holding or 0)
-            
-            # Pass ATR to Gemini so it knows volatility
             prompt = f"""
             ACT AS: Hedge Fund Manager. ASSET: {sym}
-            [TECHNICALS]
-            Weekly Trend: {w_trend}. Daily Trend: {d_tech['trend']}. RSI: {d_tech['rsi']}.
-            Daily ATR (Volatility): {d_tech['atr']}
-            [FUNDAMENTALS] PE: {fund.pe_ratio}. Smart Money: {smart_money:.2f}%
+            [TECHNICALS] Weekly Trend: {w_trend}. Daily Trend: {d_tech['trend']}. RSI: {d_tech['rsi']}. ATR: {d_tech['atr']}
+            [FUNDAMENTALS] PE: {fund.pe_ratio}. Smart Money: {(fund.promoter_holding or 0)+(fund.fii_holding or 0)}%
             [NEWS] {chr(10).join([n.title for n in news])}
             [RULES] BUY if Weekly UP + Daily UP + RSI 40-60.
             [OUTPUT JSON] {{ "signal": "BUY/WAIT", "confidence": 0-100, "reasoning": "Text" }}
@@ -219,20 +219,21 @@ def run_bot():
             res = json.loads(model.generate_content(prompt).text.strip().replace("```json","").replace("```",""))
             print(f"   ✅ {res['signal']}")
             
+            qty = 0
             if res['signal'] == "BUY":
-                # 🚨 PYTHON MATH: CALCULATE DYNAMIC STOPS (ATR BASED)
                 atr = d_tech['atr']
                 entry = live_price
-                stop_loss = int(entry - (2 * atr)) # Stop is 2x ATR below entry
-                target = int(entry + (4 * atr))    # Target is 4x ATR above (1:2 Ratio)
+                stop = int(entry - (2 * atr))
+                target = int(entry + (4 * atr))
+                risk_per_share = entry - stop
+                if risk_per_share > 0: qty = int((ACCOUNT_SIZE * RISK_PER_TRADE) / risk_per_share)
                 
-                qty = 0
-                risk_per_share = entry - stop_loss
-                if risk_per_share > 0:
-                    qty = int((ACCOUNT_SIZE * RISK_PER_TRADE) / risk_per_share)
+                res.update({'ticker': sym, 'entry_price': entry, 'target_price': target, 'stop_loss': stop})
                 
-                msg = f"🟢 *GEMINI BUY*\n💎 {sym}\nEntry: {entry}\nTgt: {target} | Stop: {stop_loss}\n(ATR: {atr:.1f})\n📦 *Qty: {qty}*\n🧠 {res['reasoning'][:200]}"
+                msg = f"🟢 *GEMINI BUY*\n💎 {sym}\nEntry: {entry}\nTgt: {target} | Stop: {stop}\n📦 *Qty: {qty}*\n🧠 {res['reasoning'][:200]}"
                 requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"})
+                
+                log_to_sheet(res, qty)
             
             time.sleep(1.5)
         except Exception as e: print(f"   ❌ Error: {e}")
