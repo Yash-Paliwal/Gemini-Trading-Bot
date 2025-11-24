@@ -3,3 +3,5 @@ pandas
 yfinance
 google-generativeai
 pydantic
+gspread
+google-auth
