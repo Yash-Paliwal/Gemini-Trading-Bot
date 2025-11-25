@@ -21,7 +21,7 @@ INDIANAPI_KEY       = os.getenv("INDIANAPI_KEY")
 GEMINI_API_KEY      = os.getenv("GEMINI_API_KEY")
 TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID")
-GDRIVE_JSON         = os.getenv("GDRIVE_CREDENTIALS") # New Secret
+GDRIVE_JSON         = os.getenv("GDRIVE_CREDENTIALS")
 SHEET_NAME          = "GeminiTrader_Logs"
 
 ACCOUNT_SIZE = 100000
@@ -93,7 +93,6 @@ def get_technicals(candles):
     loss = (-delta.where(delta<0, 0)).rolling(14).mean()
     df['rsi'] = 100 - (100/(1+(gain/loss)))
     
-    # ATR
     df['tr1'] = df['high'] - df['low']
     df['tr2'] = abs(df['high'] - df['close'].shift())
     df['tr3'] = abs(df['low'] - df['close'].shift())
@@ -142,6 +141,7 @@ def run_screener(limit=5):
         idx_data = yf.download(list(sector_universe.keys()), period="2d", progress=False)['Close']
         idx_pct = ((idx_data.iloc[-1] - idx_data.iloc[-2]) / idx_data.iloc[-2]) * 100
         top_sec = idx_pct.idxmax()
+        
         scan_list = sector_universe[top_sec.replace("^CNX","")] if idx_pct.max() > 0.8 and top_sec.replace("^CNX","") in sector_universe else all_stocks
         print(f"   🎯 Target: {top_sec} (+{idx_pct.max():.2f}%)" if idx_pct.max() > 0.8 else "   ⚠️ Market Flat. Scanning Broad.")
         
@@ -155,33 +155,41 @@ def run_screener(limit=5):
                 change = ((close.iloc[-1] - close.iloc[-2]) / close.iloc[-2]) * 100
                 if shock > 1.5 and change > 0.2: candidates[s.replace(".NS","")] = shock
             except: continue
+            
         winners = sorted(candidates, key=candidates.get, reverse=True)[:limit]
-        if not winners:
-            if len(scan_list)>1: 
-                gains = ((data['Close'].iloc[-1]-data['Close'].iloc[-2])/data['Close'].iloc[-2]*100).sort_values(ascending=False).head(limit)
-                winners = [x.replace(".NS","") for x in gains.index]
+        if not winners and len(scan_list)>1: 
+            gains = ((data['Close'].iloc[-1]-data['Close'].iloc[-2])/data['Close'].iloc[-2]*100).sort_values(ascending=False).head(limit)
+            winners = [x.replace(".NS","") for x in gains.index]
         print(f"   🚀 Candidates: {winners}")
         return winners
     except: return ["RELIANCE", "TCS"]
 
-# --- TOOL 4: LOGGING & EXECUTION ---
+# --- TOOL 4: LOGGING & EXECUTION (UPDATED) ---
 def log_to_sheet(data, qty):
-    if not GDRIVE_JSON: return
+    if not GDRIVE_JSON: 
+        print("   ⚠️ Google Sheets: No Credentials Found.")
+        return
     try:
         creds = Credentials.from_service_account_info(json.loads(GDRIVE_JSON), scopes=["https://www.googleapis.com/auth/spreadsheets"])
         gc = gspread.authorize(creds)
         sh = gc.open(SHEET_NAME).sheet1
-        if not sh.get_all_values(): sh.append_row(["Date", "Ticker", "Signal", "Entry", "Target", "Stop", "Qty", "Reasoning", "Status"])
         
-        row = [str(datetime.now().date()), data['ticker'], data['signal'], data['entry_price'], data['target_price'], data['stop_loss'], qty, data['reasoning'], "OPEN"]
+        # Auto-create headers if empty
+        if not sh.get_all_values(): 
+            sh.append_row(["Date", "Ticker", "Signal", "Entry", "Target", "Stop", "Qty", "Reasoning", "Status"])
+        
+        status = "OPEN" if data['signal'] == "BUY" else "WATCH"
+        row = [str(datetime.now().date()), data['ticker'], data['signal'], data.get('entry_price', 0), data.get('target_price', 0), data.get('stop_loss', 0), qty, data['reasoning'], status]
+        
         sh.append_row(row)
-        print("   📝 Logged to Cloud Sheet.")
-    except Exception as e: print(f"   ⚠️ Cloud Logging Failed: {e}")
+        print(f"   📝 Sheet Update: SUCCESS ({data['ticker']} -> {data['signal']})")
+        
+    except Exception as e: 
+        print(f"   ❌ Sheet Update: FAILED ({e})")
 
 def run_bot():
     print("\n🤖 STARTING CLOUD AGENT...")
     
-    # Market Check
     try:
         mkt = yf.download("^NSEI", period="1y", progress=False)
         if mkt['Close'].iloc[-1] < mkt['Close'].ewm(span=200).mean().iloc[-1]:
@@ -193,10 +201,11 @@ def run_bot():
     genai.configure(api_key=GEMINI_API_KEY)
     model = genai.GenerativeModel('models/gemini-2.5-flash', generation_config={"temperature": 0.1})
 
+    print(f"\n🧠 Analyzing {len(winners)} Stocks...")
     for sym in winners:
         key = MASTER_MAP.get(sym)
         if not key: continue
-        print(f"\n🔍 {sym}...")
+        print(f"\n🔍 Checking {sym}...")
         try:
             daily = fetch_candles(key, 400, interval="days")
             weekly = fetch_candles(key, 700, interval="weeks")
@@ -217,7 +226,6 @@ def run_bot():
             [OUTPUT JSON] {{ "signal": "BUY/WAIT", "confidence": 0-100, "reasoning": "Text" }}
             """
             res = json.loads(model.generate_content(prompt).text.strip().replace("```json","").replace("```",""))
-            print(f"   ✅ {res['signal']}")
             
             qty = 0
             if res['signal'] == "BUY":
@@ -228,12 +236,18 @@ def run_bot():
                 risk_per_share = entry - stop
                 if risk_per_share > 0: qty = int((ACCOUNT_SIZE * RISK_PER_TRADE) / risk_per_share)
                 
-                res.update({'ticker': sym, 'entry_price': entry, 'target_price': target, 'stop_loss': stop})
+                res.update({'entry_price': entry, 'target_price': target, 'stop_loss': stop})
                 
                 msg = f"🟢 *GEMINI BUY*\n💎 {sym}\nEntry: {entry}\nTgt: {target} | Stop: {stop}\n📦 *Qty: {qty}*\n🧠 {res['reasoning'][:200]}"
                 requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"})
-                
-                log_to_sheet(res, qty)
+            else:
+                # Ensure these keys exist even if WAIT so logging doesn't break
+                res.update({'ticker': sym, 'entry_price': 0, 'target_price': 0, 'stop_loss': 0})
+
+            print(f"   ✅ Decision: {res['signal']}")
+            
+            # 🚨 LOG EVERYTHING (BUY OR WAIT)
+            log_to_sheet(res, qty)
             
             time.sleep(1.5)
         except Exception as e: print(f"   ❌ Error: {e}")
