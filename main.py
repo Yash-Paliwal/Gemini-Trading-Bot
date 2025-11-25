@@ -164,13 +164,19 @@ def run_screener(limit=5):
         return winners
     except: return ["RELIANCE", "TCS"]
 
-# --- TOOL 4: LOGGING & EXECUTION (UPDATED) ---
+# --- TOOL 4: LOGGING & EXECUTION (SCOPE FIXED) ---
 def log_to_sheet(data, qty):
     if not GDRIVE_JSON: 
         print("   ⚠️ Google Sheets: No Credentials Found.")
         return
     try:
-        creds = Credentials.from_service_account_info(json.loads(GDRIVE_JSON), scopes=["https://www.googleapis.com/auth/spreadsheets"])
+        # 🚨 FIX: Added 'drive' scope so the bot can SEARCH for the sheet by name
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive"
+        ]
+        
+        creds = Credentials.from_service_account_info(json.loads(GDRIVE_JSON), scopes=scopes)
         gc = gspread.authorize(creds)
         sh = gc.open(SHEET_NAME).sheet1
         
@@ -186,7 +192,7 @@ def log_to_sheet(data, qty):
         
     except Exception as e: 
         print(f"   ❌ Sheet Update: FAILED ({e})")
-
+        
 def run_bot():
     print("\n🤖 STARTING CLOUD AGENT...")
     
