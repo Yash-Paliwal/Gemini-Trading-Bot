@@ -2,26 +2,24 @@ name: Daily Trading Bot
 
 on:
   schedule:
-    # Runs at 03:45 UTC (which is 9:15 AM IST) every Mon-Fri
     - cron: '45 3 * * 1-5'
-  workflow_dispatch: # Allows you to click a "Run Now" button manually
+  workflow_dispatch:
 
 jobs:
   trade:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - uses: actions/setup-python@v4
         with:
-          python-version: '3.11'
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-      - name: Run Bot
+          python-version: '3.11' # Keep 3.11 to avoid warnings
+      - run: pip install -r requirements.txt
+      - run: python main.py
         env:
           UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
           INDIANAPI_KEY: ${{ secrets.INDIANAPI_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python main.py
+          # 👇 THIS IS THE MISSING LINE
+          GDRIVE_CREDENTIALS: ${{ secrets.GDRIVE_CREDENTIALS }}
