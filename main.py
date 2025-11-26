@@ -255,7 +255,7 @@ def run_bot():
             print(f"   ✅ Decision: {res['signal']}")
             
             if res['signal'] == 'BUY':
-    l            og_trade(res, qty)
+                log_trade(res, qty)
             
             time.sleep(1.5)
         except Exception as e: print(f"   ❌ Error: {e}")
