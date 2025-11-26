@@ -227,6 +227,9 @@ def run_bot():
             # FIX: Ensure Ticker Exists
             res['ticker'] = sym
             
+            # ... inside the for sym in winners loop ...
+            
+            # 1. Risk Calculation (Only relevant for BUY)
             qty = 0
             if res['signal'] == "BUY":
                 atr = d_tech['atr']
@@ -238,17 +241,20 @@ def run_bot():
                 
                 res.update({'entry_price': entry, 'target_price': target, 'stop_loss': stop})
                 
+                # Send Telegram ONLY for BUYs
                 msg = f"🟢 *GEMINI BUY*\n💎 {sym}\nEntry: {entry}\nTgt: {target} | Stop: {stop}\n📦 *Qty: {qty}*\n🧠 {res['reasoning'][:200]}"
                 requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"})
-                
-                # LOG TO SUPABASE (Only if BUY)
-                log_trade(res, qty)
+            
             else:
+                # Zero out values for WAIT signals
                 res.update({'entry_price': 0, 'target_price': 0, 'stop_loss': 0})
 
             print(f"   ✅ Decision: {res['signal']}")
+            
+            # 🚨 MOVED OUTSIDE: Log EVERYTHING to Database (Buy or Wait)
+            log_trade(res, qty)
+            
             time.sleep(1.5)
         except Exception as e: print(f"   ❌ Error: {e}")
-
 if __name__ == "__main__":
     run_bot()
