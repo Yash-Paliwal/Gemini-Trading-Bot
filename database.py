@@ -42,23 +42,25 @@ def init_db():
     Base.metadata.create_all(engine)
 
 def log_trade(data, qty):
-    """Saves a new BUY signal to the DB (With Type Safety)."""
+    """Saves ANY signal to the DB (BUY or WAIT)."""
     session = Session()
     try:
+        # Determine Status based on Signal
+        trade_status = "OPEN" if data['signal'] == "BUY" else "WATCH"
+        
         new_trade = Trade(
             ticker=str(data['ticker']),
             signal=str(data['signal']),
-            # 🛡️ SAFETY: Convert to float/int to prevent DB errors
             entry_price=float(data.get('entry_price', 0)),
             target_price=float(data.get('target_price', 0)),
             stop_loss=float(data.get('stop_loss', 0)),
             quantity=int(qty),
             reasoning=str(data.get('reasoning', '')),
-            status="OPEN"
+            status=trade_status # <--- Dynamic Status
         )
         session.add(new_trade)
         session.commit()
-        print(f"   💾 Database: Trade Saved ({data['ticker']})")
+        print(f"   💾 Database: Logged {data['ticker']} ({trade_status})")
     except Exception as e:
         print(f"   ❌ Database Error: {e}")
         session.rollback()
