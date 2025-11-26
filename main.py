@@ -164,23 +164,17 @@ def run_screener(limit=5):
         return winners
     except: return ["RELIANCE", "TCS"]
 
-# --- TOOL 4: LOGGING & EXECUTION (SCOPE FIXED) ---
+# --- TOOL 4: LOGGING & EXECUTION (BUG FIXED) ---
 def log_to_sheet(data, qty):
     if not GDRIVE_JSON: 
         print("   ⚠️ Google Sheets: No Credentials Found.")
         return
     try:
-        # 🚨 FIX: Added 'drive' scope so the bot can SEARCH for the sheet by name
-        scopes = [
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive"
-        ]
-        
+        scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
         creds = Credentials.from_service_account_info(json.loads(GDRIVE_JSON), scopes=scopes)
         gc = gspread.authorize(creds)
         sh = gc.open(SHEET_NAME).sheet1
         
-        # Auto-create headers if empty
         if not sh.get_all_values(): 
             sh.append_row(["Date", "Ticker", "Signal", "Entry", "Target", "Stop", "Qty", "Reasoning", "Status"])
         
@@ -192,7 +186,7 @@ def log_to_sheet(data, qty):
         
     except Exception as e: 
         print(f"   ❌ Sheet Update: FAILED ({e})")
-        
+
 def run_bot():
     print("\n🤖 STARTING CLOUD AGENT...")
     
@@ -233,6 +227,9 @@ def run_bot():
             """
             res = json.loads(model.generate_content(prompt).text.strip().replace("```json","").replace("```",""))
             
+            # 🚨 FIX: Set Ticker HERE so it exists for both BUY and WAIT
+            res['ticker'] = sym 
+            
             qty = 0
             if res['signal'] == "BUY":
                 atr = d_tech['atr']
@@ -247,12 +244,12 @@ def run_bot():
                 msg = f"🟢 *GEMINI BUY*\n💎 {sym}\nEntry: {entry}\nTgt: {target} | Stop: {stop}\n📦 *Qty: {qty}*\n🧠 {res['reasoning'][:200]}"
                 requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"})
             else:
-                # Ensure these keys exist even if WAIT so logging doesn't break
-                res.update({'ticker': sym, 'entry_price': 0, 'target_price': 0, 'stop_loss': 0})
+                # Ensure keys exist for logging
+                res.update({'entry_price': 0, 'target_price': 0, 'stop_loss': 0})
 
             print(f"   ✅ Decision: {res['signal']}")
             
-            # 🚨 LOG EVERYTHING (BUY OR WAIT)
+            # Log Everything
             log_to_sheet(res, qty)
             
             time.sleep(1.5)
