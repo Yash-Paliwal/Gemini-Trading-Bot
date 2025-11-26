@@ -42,17 +42,18 @@ def init_db():
     Base.metadata.create_all(engine)
 
 def log_trade(data, qty):
-    """Saves a new BUY signal to the DB."""
+    """Saves a new BUY signal to the DB (With Type Safety)."""
     session = Session()
     try:
         new_trade = Trade(
-            ticker=data['ticker'],
-            signal=data['signal'],
-            entry_price=data.get('entry_price'),
-            target_price=data.get('target_price'),
-            stop_loss=data.get('stop_loss'),
-            quantity=qty,
-            reasoning=data.get('reasoning'),
+            ticker=str(data['ticker']),
+            signal=str(data['signal']),
+            # 🛡️ SAFETY: Convert to float/int to prevent DB errors
+            entry_price=float(data.get('entry_price', 0)),
+            target_price=float(data.get('target_price', 0)),
+            stop_loss=float(data.get('stop_loss', 0)),
+            quantity=int(qty),
+            reasoning=str(data.get('reasoning', '')),
             status="OPEN"
         )
         session.add(new_trade)
