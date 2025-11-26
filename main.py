@@ -12,9 +12,10 @@ from datetime import datetime, timedelta
 from typing import List, Optional
 from pydantic import BaseModel
 from html import unescape
-import gspread
-from google.oauth2.service_account import Credentials
-from database import log_trade, init_db
+from sqlalchemy import text
+
+# Import Database Tools (No more gspread)
+from database import log_trade, init_db, Session
 
 # --- CONFIGURATION ---
 UPSTOX_ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN")
@@ -22,13 +23,9 @@ INDIANAPI_KEY       = os.getenv("INDIANAPI_KEY")
 GEMINI_API_KEY      = os.getenv("GEMINI_API_KEY")
 TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID")
-GDRIVE_JSON         = os.getenv("GDRIVE_CREDENTIALS")
-SHEET_NAME          = "GeminiTrader_Logs"
 
 ACCOUNT_SIZE = 100000
 RISK_PER_TRADE = 0.02
-
-
 
 # --- DATA MODELS ---
 class PriceCandle(BaseModel):
@@ -60,6 +57,7 @@ MASTER_MAP = fetch_upstox_map()
 def get_live_price(instrument_key, symbol_fallback=None):
     url = "https://api.upstox.com/v3/market-quote/ltp"
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {UPSTOX_ACCESS_TOKEN}'}
+    
     def try_key(k):
         try:
             res = requests.get(url, params={"instrument_key": k}, headers=headers)
@@ -68,9 +66,11 @@ def get_live_price(instrument_key, symbol_fallback=None):
                 first = next(iter(d['data']))
                 return float(d['data'][first]['last_price'])
         except: return None
+    
     price = try_key(instrument_key)
     if price: return price
-    if symbol_fallback: return try_key(f"NSE_EQ|{symbol_fallback.replace('.NS','').upper()}")
+    if symbol_fallback:
+        return try_key(f"NSE_EQ|{symbol_fallback.replace('.NS','').upper()}")
     return None
 
 def fetch_candles(key, days, interval="days"):
@@ -135,7 +135,7 @@ def run_screener(limit=5):
         "^CNXIT": ["TCS.NS", "INFY.NS", "HCLTECH.NS", "TECHM.NS", "WIPRO.NS"],
         "^CNXMETAL": ["TATASTEEL.NS", "HINDALCO.NS", "JSWSTEEL.NS", "VEDL.NS"],
         "^CNXPHARMA": ["SUNPHARMA.NS", "DRREDDY.NS", "CIPLA.NS"],
-        "^CNXFMCG": ["ITC.NS", "HINDUNILVR.NS", "NESTLEIND.NS", "TATACONSUM.NS"],
+        "^CNXFMCG": ["ITC.NS", "HINDUNILVR.NS", "NESTLEIND.NS", "TATACONSUM.NS", "VBL.NS"],
         "^NSEBANK": ["HDFCBANK.NS", "ICICIBANK.NS", "SBIN.NS", "KOTAKBANK.NS", "AXISBANK.NS"]
     }
     all_stocks = [s for sublist in sector_universe.values() for s in sublist]
@@ -160,41 +160,33 @@ def run_screener(limit=5):
             except: continue
             
         winners = sorted(candidates, key=candidates.get, reverse=True)[:limit]
-        if not winners and len(scan_list)>1: 
-            gains = ((data['Close'].iloc[-1]-data['Close'].iloc[-2])/data['Close'].iloc[-2]*100).sort_values(ascending=False).head(limit)
-            winners = [x.replace(".NS","") for x in gains.index]
+        if not winners:
+            if len(scan_list)>1: 
+                gains = ((data['Close'].iloc[-1]-data['Close'].iloc[-2])/data['Close'].iloc[-2]*100).sort_values(ascending=False).head(limit)
+                winners = [x.replace(".NS","") for x in gains.index]
         print(f"   🚀 Candidates: {winners}")
         return winners
     except: return ["RELIANCE", "TCS"]
 
-# --- TOOL 4: LOGGING & EXECUTION (BUG FIXED) ---
-def log_to_sheet(data, qty):
-    if not GDRIVE_JSON: 
-        print("   ⚠️ Google Sheets: No Credentials Found.")
-        return
-    try:
-        scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-        creds = Credentials.from_service_account_info(json.loads(GDRIVE_JSON), scopes=scopes)
-        gc = gspread.authorize(creds)
-        sh = gc.open(SHEET_NAME).sheet1
-        
-        if not sh.get_all_values(): 
-            sh.append_row(["Date", "Ticker", "Signal", "Entry", "Target", "Stop", "Qty", "Reasoning", "Status"])
-        
-        status = "OPEN" if data['signal'] == "BUY" else "WATCH"
-        row = [str(datetime.now().date()), data['ticker'], data['signal'], data.get('entry_price', 0), data.get('target_price', 0), data.get('stop_loss', 0), qty, data['reasoning'], status]
-        
-        sh.append_row(row)
-        print(f"   📝 Sheet Update: SUCCESS ({data['ticker']} -> {data['signal']})")
-        
-    except Exception as e: 
-        print(f"   ❌ Sheet Update: FAILED ({e})")
-
+# --- TOOL 4: EXECUTION ---
 def run_bot():
-    # Inside run_bot(), before scanning
-    init_db()
     print("\n🤖 STARTING CLOUD AGENT...")
     
+    # 1. DB CHECK
+    print("🔌 Testing Database...", end=" ")
+    try:
+        session = Session()
+        session.execute(text("SELECT 1"))
+        session.close()
+        print("✅ OK!")
+    except Exception as e:
+        print(f"❌ DB FAIL: {e}")
+        return
+
+    try: init_db()
+    except: pass
+
+    # 2. MARKET CHECK
     try:
         mkt = yf.download("^NSEI", period="1y", progress=False)
         if mkt['Close'].iloc[-1] < mkt['Close'].ewm(span=200).mean().iloc[-1]:
@@ -232,8 +224,8 @@ def run_bot():
             """
             res = json.loads(model.generate_content(prompt).text.strip().replace("```json","").replace("```",""))
             
-            # 🚨 FIX: Set Ticker HERE so it exists for both BUY and WAIT
-            res['ticker'] = sym 
+            # FIX: Ensure Ticker Exists
+            res['ticker'] = sym
             
             qty = 0
             if res['signal'] == "BUY":
@@ -248,15 +240,13 @@ def run_bot():
                 
                 msg = f"🟢 *GEMINI BUY*\n💎 {sym}\nEntry: {entry}\nTgt: {target} | Stop: {stop}\n📦 *Qty: {qty}*\n🧠 {res['reasoning'][:200]}"
                 requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"})
+                
+                # LOG TO SUPABASE (Only if BUY)
+                log_trade(res, qty)
             else:
-                # Ensure keys exist for logging
                 res.update({'entry_price': 0, 'target_price': 0, 'stop_loss': 0})
 
             print(f"   ✅ Decision: {res['signal']}")
-            
-            if res['signal'] == 'BUY':
-                log_trade(res, qty)
-            
             time.sleep(1.5)
         except Exception as e: print(f"   ❌ Error: {e}")
 
