@@ -2,7 +2,7 @@ name: Daily Trading Bot
 
 on:
   schedule:
-    - cron: '45 3 * * 1-5'
+    - cron: '45 9 * * 1-5'  # This is 09:45 UTC = 15:15 IST
   workflow_dispatch:
 
 jobs:
