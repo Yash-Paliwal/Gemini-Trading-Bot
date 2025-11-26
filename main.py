@@ -14,6 +14,7 @@ from pydantic import BaseModel
 from html import unescape
 import gspread
 from google.oauth2.service_account import Credentials
+from database import log_trade, init_db
 
 # --- CONFIGURATION ---
 UPSTOX_ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN")
@@ -26,6 +27,8 @@ SHEET_NAME          = "GeminiTrader_Logs"
 
 ACCOUNT_SIZE = 100000
 RISK_PER_TRADE = 0.02
+
+
 
 # --- DATA MODELS ---
 class PriceCandle(BaseModel):
@@ -188,6 +191,8 @@ def log_to_sheet(data, qty):
         print(f"   ❌ Sheet Update: FAILED ({e})")
 
 def run_bot():
+    # Inside run_bot(), before scanning
+    init_db()
     print("\n🤖 STARTING CLOUD AGENT...")
     
     try:
@@ -249,8 +254,8 @@ def run_bot():
 
             print(f"   ✅ Decision: {res['signal']}")
             
-            # Log Everything
-            log_to_sheet(res, qty)
+            if res['signal'] == 'BUY':
+    l            og_trade(res, qty)
             
             time.sleep(1.5)
         except Exception as e: print(f"   ❌ Error: {e}")
