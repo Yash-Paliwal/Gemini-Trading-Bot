@@ -1,13 +1,14 @@
-name: Daily Trading Bot
+name: Trade Watchdog
 
 on:
   schedule:
-    # Runs at 09:45 UTC = 15:15 IST (3:15 PM) every Mon-Fri
-    - cron: '45 9 * * 1-5'
-  workflow_dispatch: # Allows you to click the "Run workflow" button manually
+    # Runs every 30 minutes from 04:00 UTC (9:30 AM IST) to 10:00 UTC (3:30 PM IST)
+    # This covers the entire Indian Trading Day
+    - cron: '*/30 4-10 * * 1-5'
+  workflow_dispatch: # Allows manual trigger button
 
 jobs:
-  trade:
+  watch:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -16,24 +17,20 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.11' # Using 3.11 to match your local setup
+          python-version: '3.11'
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run Bot
+      - name: Run Watchdog
         env:
-          # API Keys
+          # We need ALL secrets because the tools use them
           UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
           INDIANAPI_KEY: ${{ secrets.INDIANAPI_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          
-          # Telegram
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          
-          # Database (Supabase)
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: python main.py
+        run: python monitor.py
