@@ -4,9 +4,7 @@ from sqlalchemy.orm import sessionmaker, declarative_base
 from datetime import datetime
 from .config import DATABASE_URL
 
-# --- SETUP ---
 Base = declarative_base()
-# pool_pre_ping=True prevents connection drops
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 Session = sessionmaker(bind=engine)
 
@@ -30,69 +28,96 @@ class Log(Base):
     __tablename__ = 'app_logs'
     id = Column(Integer, primary_key=True)
     timestamp = Column(DateTime, default=datetime.now)
-    level = Column(String)
+    level = Column(String) # INFO, SIGNAL, ERROR
     message = Column(Text)
 
 # --- FUNCTIONS ---
-
 def init_db():
-    """Creates tables if they don't exist."""
     try: Base.metadata.create_all(engine)
     except: pass
+    
+    # Init Portfolio if missing
+    session = Session()
+    if not session.query(Portfolio).first():
+        session.add(Portfolio(id=1, balance=100000.0))
+        session.commit()
+    session.close()
 
-def log_trade(data, qty):
-    """Saves a new trade to the DB."""
+class Portfolio(Base):
+    __tablename__ = 'portfolio'
+    id = Column(Integer, primary_key=True)
+    balance = Column(Float, default=100000.0)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+# --- CASH MANAGER ---
+def get_current_balance():
     session = Session()
     try:
-        # Determine status: BUY -> OPEN, WAIT -> WATCH
-        status = "OPEN" if data['signal'] == "BUY" else "WATCH"
-        
+        p = session.query(Portfolio).first()
+        return p.balance if p else 0.0
+    finally: session.close()
+
+def update_balance(amount):
+    session = Session()
+    try:
+        p = session.query(Portfolio).first()
+        p.balance += float(amount)
+        session.commit()
+        print(f"   💰 Wallet Updated: ₹{p.balance:,.2f}")
+    except: session.rollback()
+    finally: session.close()
+
+# --- LOGGING (SEPARATED) ---
+def log_trade(data, qty):
+    """Saves ONLY actual trades."""
+    session = Session()
+    try:
         new_trade = Trade(
             ticker=str(data['ticker']),
-            signal=str(data['signal']),
+            signal="BUY", # Only BUYs go here
             entry_price=float(data.get('entry_price', 0)),
             target_price=float(data.get('target_price', 0)),
             stop_loss=float(data.get('stop_loss', 0)),
             quantity=int(qty),
             reasoning=str(data.get('reasoning', '')),
-            status=status
+            status="OPEN"
         )
         session.add(new_trade)
         session.commit()
-        print(f"   💾 DB: Saved {data['ticker']} ({status})")
-    except Exception as e:
-        print(f"   ❌ DB Error: {e}")
-        session.rollback()
-    finally:
-        session.close()
+        print(f"   💾 DB: Trade Opened ({data['ticker']})")
+    except Exception as e: print(f"   ❌ DB Trade Error: {e}")
+    finally: session.close()
 
-# --- 👇 THE MISSING FUNCTIONS 👇 ---
+def log_signal_audit(ticker, signal, reasoning):
+    """Saves WAIT signals to app_logs, keeping trades table clean."""
+    session = Session()
+    try:
+        log_entry = Log(
+            level="SIGNAL",
+            message=f"{ticker}: {signal} - {reasoning}"
+        )
+        session.add(log_entry)
+        session.commit()
+        print(f"   🗂️ Audit Log: {ticker} -> {signal}")
+    except: pass
+    finally: session.close()
 
+# --- TRADE MANAGEMENT ---
 def get_open_trades():
-    """Fetches all active trades (Status = OPEN)."""
     session = Session()
-    try:
-        trades = session.query(Trade).filter(Trade.status == 'OPEN').all()
-        return trades
-    except Exception as e:
-        print(f"   ❌ DB Read Error: {e}")
-        return []
-    finally:
-        session.close()
+    try: return session.query(Trade).filter(Trade.status == 'OPEN').all()
+    finally: session.close()
 
-def update_trade_status(trade_id, new_status, exit_price, pnl):
-    """Closes a trade (Updates Status, Exit Price, and PnL)."""
+def update_trade_status(trade_id, status, exit_price, pnl):
     session = Session()
     try:
-        trade = session.query(Trade).filter(Trade.id == trade_id).first()
-        if trade:
-            trade.status = new_status
-            trade.exit_time = datetime.now()
-            trade.pnl = pnl
+        t = session.query(Trade).filter(Trade.id == trade_id).first()
+        if t:
+            t.status = status
+            t.exit_time = datetime.now()
+            t.pnl = pnl
+            # We don't have an exit_price column, but PnL captures the math
             session.commit()
-            print(f"   🔒 Trade {trade.ticker} Closed ({new_status}).")
-    except Exception as e:
-        print(f"   ❌ DB Update Failed: {e}")
-        session.rollback()
-    finally:
-        session.close()
+            print(f"   🔒 Trade Closed. PnL: {pnl}")
+    except: session.rollback()
+    finally: session.close()
