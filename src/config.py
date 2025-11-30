@@ -12,3 +12,7 @@ DATABASE_URL        = os.getenv("DATABASE_URL")
 
 ACCOUNT_SIZE = 100000
 RISK_PER_TRADE = 0.02
+
+# --- MODES ---
+# 🚨 Missing Line Added Below:
+PAPER_MODE = os.getenv("PAPER_MODE", "True").lower() == "true"

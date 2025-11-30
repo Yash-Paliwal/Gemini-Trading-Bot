@@ -1,6 +1,6 @@
 import google.generativeai as genai
 import json
-from .config import GEMINI_API_KEY
+from src.config import GEMINI_API_KEY
 
 def analyze_stock_ai(name, d_tech, w_trend, fund, news):
     genai.configure(api_key=GEMINI_API_KEY)

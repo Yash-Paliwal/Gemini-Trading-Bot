@@ -1,42 +1,64 @@
-import os
 import time
-import json
 import requests
 import yfinance as yf
-import google.generativeai as genai
-from datetime import datetime, timedelta
-from typing import List, Optional
-from pydantic import BaseModel
-from html import unescape
-from sqlalchemy import text
+from datetime import datetime
 
-# --- IMPORTS FROM SRC ---
-from src.database import log_trade, init_db, Session, get_open_trades
-from src.tools import fetch_upstox_map, get_live_price, fetch_candles, fetch_funds, fetch_news
-from src.strategy import run_screener, get_technicals, calculate_weekly_trend
-from src.brain import analyze_stock_ai
+# --- 1. CONFIGURATION & CLIENTS ---
+from src.config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, ACCOUNT_SIZE, RISK_PER_TRADE, PAPER_MODE
 from src.upstox_client import upstox_client
 
-# --- CONFIGURATION ---
-UPSTOX_ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN")
-INDIANAPI_KEY       = os.getenv("INDIANAPI_KEY")
-GEMINI_API_KEY      = os.getenv("GEMINI_API_KEY")
-TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID")
+# --- 2. CORE INFRASTRUCTURE ---
+from src.database import init_db, log_trade, Session
+from src.tools import fetch_upstox_map, get_live_price, fetch_candles, fetch_funds, fetch_news
 
-# 🚨 PAPER TRADING SWITCH
-PAPER_MODE = os.getenv("PAPER_MODE", "True").lower() == "true"
+# --- 3. MODULES (THE NEW LOGIC) ---
+# FINDER: Locates trades and analyzes charts
+from src.finder.strategy import run_screener, get_technicals, calculate_weekly_trend
+from src.finder.brain import analyze_stock_ai
 
-ACCOUNT_SIZE = 100000
-RISK_PER_TRADE = 0.02
+# PORTFOLIO: Checks rules before entering
+from src.portfolio.manager import check_portfolio_health
 
-# --- TOOL: EXECUTION ---
+# RISK: Calculates exact size based on VIX
+from src.risk.calculator import calculate_position_size
+
+# --- HELPER: TELEGRAM SENDER ---
+def send_telegram_alert(t, qty, live_price):
+    emoji = "⚠️" if t['signal'] == "WAIT" else ("🟢" if t['signal']=="BUY" else "🔴")
+    mode_tag = "📝 *PAPER*" if PAPER_MODE else "💸 *LIVE*"
+    
+    qty_text = ""
+    if t['signal'] == "BUY":
+        risk_amt = ACCOUNT_SIZE * RISK_PER_TRADE
+        qty_text = f"\n📦 *SIZE: {qty} Shares* (Risk: ₹{risk_amt:.0f})"
+
+    msg = (
+        f"{emoji} *GEMINI ALERT* ({mode_tag})\n"
+        f"💎 *{t.get('ticker')}*\n"
+        f"🚀 *{t['signal']}* (Conf: {t['confidence']}%)\n"
+        f"⚡ Entry: {live_price}\n"
+        f"🎯 Tgt: {t['target_price']} | 🛑 Stop: {t['stop_loss']}"
+        f"{qty_text}\n\n"
+        f"🧠 {t['reasoning'][:200]}"
+    )
+    try:
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"})
+    except Exception as e:
+        print(f"   ❌ Telegram Error: {e}")
+
+# --- MAIN EXECUTION ENGINE ---
 def run_bot():
     mode_label = "📝 PAPER MODE" if PAPER_MODE else "💸 REAL MONEY MODE"
-    print(f"\n🤖 STARTING CLOUD AGENT ({mode_label})...")
+    print(f"\n🤖 STARTING HEDGE FUND ENGINE ({mode_label})...")
+    print(f"   🕒 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+    # ---------------------------------------------------------
+    # STEP 1: SYSTEM HEALTH CHECK
+    # ---------------------------------------------------------
     
-    # 1. INITIALIZE UPSTOX GATEKEEPER
+    # A. Upstox Login
     print("🔌 Connecting to Upstox...", end=" ")
+    from src.config import UPSTOX_ACCESS_TOKEN # Import locally to ensure freshness
     upstox_client.set_access_token(UPSTOX_ACCESS_TOKEN)
     
     if upstox_client.check_connection():
@@ -46,115 +68,111 @@ def run_bot():
         requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": "🔴 *CRITICAL FAIL*: Upstox Token Expired!", "parse_mode": "Markdown"})
         return
 
-    # 2. DB CHECK
+    # B. Database Check
     print("🔌 Testing Database...", end=" ")
     try:
-        session = Session()
-        session.execute(text("SELECT 1"))
-        session.close()
-        print("✅ ONLINE!")
+        init_db() # Create tables if missing
+        print("✅ Online.")
     except Exception as e:
         print(f"❌ DATABASE FAILED: {e}")
         return
 
-    try: init_db()
-    except: pass
-
-    # 3. CHECK EXISTING POSITIONS
-    open_trades = get_open_trades()
-    open_tickers = [t.ticker for t in open_trades]
-    print(f"   📋 Portfolio Positions: {open_tickers}")
-
-    # 4. MARKET CHECK
+    # ---------------------------------------------------------
+    # STEP 2: MACRO FILTER (The "Traffic Light")
+    # ---------------------------------------------------------
     try:
+        print("🚦 Checking Market Regime...", end=" ")
         mkt = yf.download("^NSEI", period="1y", progress=False)
-        if mkt['Close'].iloc[-1] < mkt['Close'].ewm(span=200).mean().iloc[-1]:
-            msg = f"🔴 *MARKET DOWNTREND* - {mode_label} HALTED"
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"})
-            return
-    except: pass
+        # Check if DataFrame is valid
+        if not mkt.empty and 'Close' in mkt.columns:
+            current_nifty = float(mkt['Close'].iloc[-1])
+            ema200_nifty = float(mkt['Close'].ewm(span=200).mean().iloc[-1])
+            
+            if current_nifty < ema200_nifty:
+                msg = f"🔴 *MARKET DOWNTREND* - {mode_label} HALTED (Nifty < 200 EMA)"
+                print(f"BEARISH ({current_nifty:.0f} < {ema200_nifty:.0f})")
+                requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"})
+                return
+            print(f"BULLISH ({current_nifty:.0f} > {ema200_nifty:.0f})")
+    except Exception as e: 
+        print(f"⚠️ Market Check Error: {e} (Proceeding with Caution)")
 
-    # 5. SCAN & ANALYZE
+    # ---------------------------------------------------------
+    # STEP 3: FINDING & FILTERING
+    # ---------------------------------------------------------
     winners = run_screener(limit=5)
     master_map = fetch_upstox_map()
 
-    print(f"\n🧠 Analyzing {len(winners)} Stocks...")
+    print(f"\n🧠 Analyzing {len(winners)} Candidates...")
+    
     for sym in winners:
-        if sym in open_tickers:
-            print(f"   ⚠️ Skipping {sym}: Position already OPEN.")
+        # A. PORTFOLIO GATEKEEPER
+        # Before we fetch data, check if we are allowed to buy this
+        allowed, reason = check_portfolio_health(sym)
+        if not allowed:
+            print(f"   ⛔ SKIPPING {sym}: {reason}")
             continue
 
         key = master_map.get(sym)
-        if not key: continue
+        if not key: 
+            print(f"   ⚠️ No Key for {sym}")
+            continue
+            
         print(f"\n🔍 Checking {sym}...")
+        
         try:
+            # B. DATA GATHERING
             daily = fetch_candles(key, 400, "days")
             weekly = fetch_candles(key, 700, "weeks")
-            if not daily or not weekly: continue
+            if not daily or not weekly: 
+                print("   ⚠️ Insufficient Data"); continue
 
             d_tech = get_technicals(daily)
             w_trend = calculate_weekly_trend(weekly)
             fund = fetch_funds(sym)
             news = fetch_news(sym)
+            
+            # Get Live Price (Crucial for Execution)
             live_price = get_live_price(key, sym) or d_tech['price']
 
-            # Construct the Prompt
-            smart_money = (fund.promoter_holding or 0) + (fund.fii_holding or 0)
-            prompt = f"""
-            ACT AS: Hedge Fund Manager. ASSET: {sym}
-            [TECHNICALS] Weekly Trend: {w_trend}. Daily Trend: {d_tech['trend']}. RSI: {d_tech['rsi']}. ATR: {d_tech['atr']}
-            [FUNDAMENTALS] PE: {fund.pe_ratio}. Smart Money: {smart_money:.2f}%
-            [NEWS] {chr(10).join([n.title for n in news])}
-            [RULES] BUY if Weekly UP + Daily UP + RSI 40-60.
-            [OUTPUT JSON] {{ "signal": "BUY/WAIT", "confidence": 0-100, "reasoning": "Text" }}
-            """
-
-            # 🔍 DEBUG: PRINT PROMPT TO CONSOLE 🔍
-            print("\n" + "="*50)
-            print(f"🤖 SENDING TO GEMINI ({sym}):")
-            print("-" * 50)
-            print(prompt)
-            print("="*50 + "\n")
-
-            # Call Gemini
-            genai.configure(api_key=GEMINI_API_KEY)
-            model = genai.GenerativeModel('models/gemini-2.5-flash', generation_config={"temperature": 0.1})
-            res = json.loads(model.generate_content(prompt).text.strip().replace("```json","").replace("```",""))
-            
+            # C. AI ANALYSIS (The Brain)
+            res = analyze_stock_ai(sym, d_tech, w_trend, fund, news)
             res['ticker'] = sym
             
+            # D. EXECUTION LOGIC
             qty = 0
             if res['signal'] == "BUY":
                 atr = d_tech['atr']
+                
+                # Dynamic ATR-Based Stops
                 entry = live_price
                 stop = int(entry - (2 * atr))
                 target = int(entry + (4 * atr))
                 
-                risk_per_share = entry - stop
-                if risk_per_share > 0: 
-                    qty = int((ACCOUNT_SIZE * RISK_PER_TRADE) / risk_per_share)
+                # RISK MANAGER (Position Sizing)
+                qty = calculate_position_size(entry, stop)
                 
+                # Update Result Object
                 res.update({'entry_price': entry, 'target_price': target, 'stop_loss': stop})
                 
-                title = "📝 *PAPER TRADE*" if PAPER_MODE else "🟢 *LIVE TRADE*"
-                msg = (
-                    f"{title}\n"
-                    f"💎 *{sym}*\n"
-                    f"Entry: {entry}\n"
-                    f"Tgt: {target} | Stop: {stop}\n"
-                    f"📦 Qty: {qty} (Risk: ₹{ACCOUNT_SIZE*RISK_PER_TRADE:.0f})\n"
-                    f"🧠 {res['reasoning'][:200]}"
-                )
-                requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"})
+                # Alert
+                send_telegram_alert(res, qty, live_price)
                 
             else:
+                # Zero out for logs
                 res.update({'entry_price': 0, 'target_price': 0, 'stop_loss': 0})
 
             print(f"   ✅ Decision: {res['signal']}")
+            
+            # E. LOGGING (Audit Trail)
             log_trade(res, qty)
             
-            time.sleep(1.5)
-        except Exception as e: print(f"   ❌ Error: {e}")
+            time.sleep(1.5) # Rate limit protection
+
+        except Exception as e: 
+            print(f"   ❌ Error analyzing {sym}: {e}")
+
+    print("\n🏁 SESSION COMPLETE.")
 
 if __name__ == "__main__":
     run_bot()
