@@ -5,17 +5,15 @@ import requests
 import yfinance as yf
 import google.generativeai as genai
 from datetime import datetime, timedelta
-from typing import List, Optional
-from pydantic import BaseModel
 from html import unescape
 from sqlalchemy import text
 
-# Import Database Tools
-from src.database import log_trade, init_db, Session
+# --- IMPORTS FROM SRC ---
+from src.database import log_trade, init_db, Session, get_open_trades
 from src.tools import fetch_upstox_map, get_live_price, fetch_candles, fetch_funds, fetch_news
 from src.strategy import run_screener, get_technicals, calculate_weekly_trend
 from src.brain import analyze_stock_ai
-from src.notifier import send_alert # We will override this slightly or use it directly
+from src.upstox_client import upstox_client
 
 # --- CONFIGURATION ---
 UPSTOX_ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN")
@@ -24,19 +22,29 @@ GEMINI_API_KEY      = os.getenv("GEMINI_API_KEY")
 TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID")
 
-# 🚨 PAPER TRADING SWITCH 🚨
-# If this is "True", the bot acts in Simulation Mode
+# 🚨 PAPER TRADING SWITCH
 PAPER_MODE = os.getenv("PAPER_MODE", "True").lower() == "true"
 
 ACCOUNT_SIZE = 100000
 RISK_PER_TRADE = 0.02
 
-# --- TOOL: EXECUTION ---
+# --- EXECUTION ---
 def run_bot():
     mode_label = "📝 PAPER MODE" if PAPER_MODE else "💸 REAL MONEY MODE"
     print(f"\n🤖 STARTING CLOUD AGENT ({mode_label})...")
     
-    # 1. DB CHECK
+    # 1. INITIALIZE UPSTOX GATEKEEPER
+    print("🔌 Connecting to Upstox...", end=" ")
+    upstox_client.set_access_token(UPSTOX_ACCESS_TOKEN)
+    
+    if upstox_client.check_connection():
+        print("✅ Connection Good.")
+    else:
+        print("❌ Upstox Connection Failed. STOPPING.")
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": "🔴 *CRITICAL FAIL*: Upstox Token Expired!", "parse_mode": "Markdown"})
+        return
+
+    # 2. DB CHECK
     print("🔌 Testing Database...", end=" ")
     try:
         session = Session()
@@ -50,7 +58,12 @@ def run_bot():
     try: init_db()
     except: pass
 
-    # 2. MARKET CHECK
+    # 3. CHECK EXISTING POSITIONS (Prevent Duplicates)
+    open_trades = get_open_trades()
+    open_tickers = [t.ticker for t in open_trades]
+    print(f"   📋 Portfolio Positions: {open_tickers}")
+
+    # 4. MARKET CHECK
     try:
         mkt = yf.download("^NSEI", period="1y", progress=False)
         if mkt['Close'].iloc[-1] < mkt['Close'].ewm(span=200).mean().iloc[-1]:
@@ -59,13 +72,17 @@ def run_bot():
             return
     except: pass
 
+    # 5. SCAN & ANALYZE
     winners = run_screener(limit=5)
-    
-    # Helper to get map
     master_map = fetch_upstox_map()
 
     print(f"\n🧠 Analyzing {len(winners)} Stocks...")
     for sym in winners:
+        # SKIP DUPLICATES
+        if sym in open_tickers:
+            print(f"   ⚠️ Skipping {sym}: Position already OPEN.")
+            continue
+
         key = master_map.get(sym)
         if not key: continue
         print(f"\n🔍 Checking {sym}...")
@@ -78,6 +95,8 @@ def run_bot():
             w_trend = calculate_weekly_trend(weekly)
             fund = fetch_funds(sym)
             news = fetch_news(sym)
+            
+            # Get Live Price via Client
             live_price = get_live_price(key, sym) or d_tech['price']
 
             # AI Analysis
@@ -98,9 +117,8 @@ def run_bot():
                 
                 res.update({'entry_price': entry, 'target_price': target, 'stop_loss': stop})
                 
-                # --- TELEGRAM ALERT (Modified for Paper) ---
+                # --- TELEGRAM ALERT ---
                 title = "📝 *PAPER TRADE*" if PAPER_MODE else "🟢 *LIVE TRADE*"
-                
                 msg = (
                     f"{title}\n"
                     f"💎 *{sym}*\n"
@@ -111,17 +129,14 @@ def run_bot():
                 )
                 requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"})
                 
-                # LOG TO DATABASE
-                # We log it exactly the same way. The Watchdog doesn't care if it's paper.
-                log_trade(res, qty)
-                
-                # (FUTURE) IF NOT PAPER MODE:
-                # if not PAPER_MODE:
-                #     place_upstox_order(...) 
             else:
                 res.update({'entry_price': 0, 'target_price': 0, 'stop_loss': 0})
 
             print(f"   ✅ Decision: {res['signal']}")
+            
+            # Log Everything (Status is handled inside log_trade)
+            log_trade(res, qty)
+            
             time.sleep(1.5)
         except Exception as e: print(f"   ❌ Error: {e}")
 
