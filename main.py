@@ -5,6 +5,8 @@ import requests
 import yfinance as yf
 import google.generativeai as genai
 from datetime import datetime, timedelta
+from typing import List, Optional
+from pydantic import BaseModel
 from html import unescape
 from sqlalchemy import text
 
@@ -28,7 +30,7 @@ PAPER_MODE = os.getenv("PAPER_MODE", "True").lower() == "true"
 ACCOUNT_SIZE = 100000
 RISK_PER_TRADE = 0.02
 
-# --- EXECUTION ---
+# --- TOOL: EXECUTION ---
 def run_bot():
     mode_label = "📝 PAPER MODE" if PAPER_MODE else "💸 REAL MONEY MODE"
     print(f"\n🤖 STARTING CLOUD AGENT ({mode_label})...")
@@ -58,7 +60,7 @@ def run_bot():
     try: init_db()
     except: pass
 
-    # 3. CHECK EXISTING POSITIONS (Prevent Duplicates)
+    # 3. CHECK EXISTING POSITIONS
     open_trades = get_open_trades()
     open_tickers = [t.ticker for t in open_trades]
     print(f"   📋 Portfolio Positions: {open_tickers}")
@@ -78,7 +80,6 @@ def run_bot():
 
     print(f"\n🧠 Analyzing {len(winners)} Stocks...")
     for sym in winners:
-        # SKIP DUPLICATES
         if sym in open_tickers:
             print(f"   ⚠️ Skipping {sym}: Position already OPEN.")
             continue
@@ -95,12 +96,31 @@ def run_bot():
             w_trend = calculate_weekly_trend(weekly)
             fund = fetch_funds(sym)
             news = fetch_news(sym)
-            
-            # Get Live Price via Client
             live_price = get_live_price(key, sym) or d_tech['price']
 
-            # AI Analysis
-            res = analyze_stock_ai(sym, d_tech, w_trend, fund, news)
+            # Construct the Prompt
+            smart_money = (fund.promoter_holding or 0) + (fund.fii_holding or 0)
+            prompt = f"""
+            ACT AS: Hedge Fund Manager. ASSET: {sym}
+            [TECHNICALS] Weekly Trend: {w_trend}. Daily Trend: {d_tech['trend']}. RSI: {d_tech['rsi']}. ATR: {d_tech['atr']}
+            [FUNDAMENTALS] PE: {fund.pe_ratio}. Smart Money: {smart_money:.2f}%
+            [NEWS] {chr(10).join([n.title for n in news])}
+            [RULES] BUY if Weekly UP + Daily UP + RSI 40-60.
+            [OUTPUT JSON] {{ "signal": "BUY/WAIT", "confidence": 0-100, "reasoning": "Text" }}
+            """
+
+            # 🔍 DEBUG: PRINT PROMPT TO CONSOLE 🔍
+            print("\n" + "="*50)
+            print(f"🤖 SENDING TO GEMINI ({sym}):")
+            print("-" * 50)
+            print(prompt)
+            print("="*50 + "\n")
+
+            # Call Gemini
+            genai.configure(api_key=GEMINI_API_KEY)
+            model = genai.GenerativeModel('models/gemini-2.5-flash', generation_config={"temperature": 0.1})
+            res = json.loads(model.generate_content(prompt).text.strip().replace("```json","").replace("```",""))
+            
             res['ticker'] = sym
             
             qty = 0
@@ -110,14 +130,12 @@ def run_bot():
                 stop = int(entry - (2 * atr))
                 target = int(entry + (4 * atr))
                 
-                # Position Sizing
                 risk_per_share = entry - stop
                 if risk_per_share > 0: 
                     qty = int((ACCOUNT_SIZE * RISK_PER_TRADE) / risk_per_share)
                 
                 res.update({'entry_price': entry, 'target_price': target, 'stop_loss': stop})
                 
-                # --- TELEGRAM ALERT ---
                 title = "📝 *PAPER TRADE*" if PAPER_MODE else "🟢 *LIVE TRADE*"
                 msg = (
                     f"{title}\n"
@@ -133,8 +151,6 @@ def run_bot():
                 res.update({'entry_price': 0, 'target_price': 0, 'stop_loss': 0})
 
             print(f"   ✅ Decision: {res['signal']}")
-            
-            # Log Everything (Status is handled inside log_trade)
             log_trade(res, qty)
             
             time.sleep(1.5)

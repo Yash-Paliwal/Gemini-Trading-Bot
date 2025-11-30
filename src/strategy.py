@@ -1,47 +1,72 @@
 import pandas as pd
 import yfinance as yf
+import numpy as np
 
-# --- 1. TECHNICAL MATH ENGINE ---
+# --- 1. SUPER TECHNICAL ENGINE (MACD + ADX + BOL) ---
 def get_technicals(candles):
     if not candles or len(candles) < 200: return None
     
-    # Handle Pydantic v1 vs v2
+    # Standard Data Prep
     try: data = [c.model_dump() for c in candles]
     except: data = [c.dict() for c in candles]
-        
     df = pd.DataFrame(data)
     df['close'] = df['close'].astype(float)
-    df['high'] = df['high'].astype(float); df['low'] = df['low'].astype(float)
+    df['high'] = df['high'].astype(float)
+    df['low'] = df['low'].astype(float)
     
-    # Indicators
+    # 1. EMAs
     df['ema_50'] = df['close'].ewm(span=50).mean()
     df['ema_200'] = df['close'].ewm(span=200).mean()
     
+    # 2. RSI (14)
     delta = df['close'].diff()
     gain = (delta.where(delta>0, 0)).rolling(14).mean()
     loss = (-delta.where(delta<0, 0)).rolling(14).mean()
     df['rsi'] = 100 - (100/(1+(gain/loss)))
     
-    # ATR (Volatility)
-    df['tr1'] = df['high'] - df['low']
-    df['tr2'] = abs(df['high'] - df['close'].shift())
-    df['tr3'] = abs(df['low'] - df['close'].shift())
-    df['tr'] = df[['tr1', 'tr2', 'tr3']].max(axis=1)
+    # 3. MACD (12, 26, 9) - MOMENTUM
+    exp1 = df['close'].ewm(span=12, adjust=False).mean()
+    exp2 = df['close'].ewm(span=26, adjust=False).mean()
+    df['macd'] = exp1 - exp2
+    df['signal'] = df['macd'].ewm(span=9, adjust=False).mean()
+    df['macd_hist'] = df['macd'] - df['signal']
+    
+    # 4. ADX (14) - TREND STRENGTH
+    # (Simplified True Range calculation for speed)
+    df['tr'] = df[['high', 'low', 'close']].apply(
+        lambda x: max(x['high']-x['low'], abs(x['high']-x['close']), abs(x['low']-x['close'])), axis=1
+    )
     df['atr'] = df['tr'].rolling(14).mean()
     
+    # Directional Movement
+    df['up_move'] = df['high'] - df['high'].shift(1)
+    df['down_move'] = df['low'].shift(1) - df['low']
+    df['plus_dm'] = np.where((df['up_move'] > df['down_move']) & (df['up_move'] > 0), df['up_move'], 0)
+    df['minus_dm'] = np.where((df['down_move'] > df['up_move']) & (df['down_move'] > 0), df['down_move'], 0)
+    
+    df['plus_di'] = 100 * (df['plus_dm'].rolling(14).mean() / df['atr'])
+    df['minus_di'] = 100 * (df['minus_dm'].rolling(14).mean() / df['atr'])
+    df['dx'] = 100 * abs((df['plus_di'] - df['minus_di']) / (df['plus_di'] + df['minus_di']))
+    df['adx'] = df['dx'].rolling(14).mean()
+
     cur = df.iloc[-1]
+    
     return {
-        "rsi": round(cur['rsi'],2), 
-        "price": cur['close'], 
-        "atr": round(cur['atr'],2), 
-        "trend": "UP" if cur['close']>cur['ema_200'] else "DOWN"
+        "price": round(cur['close'], 2),
+        "rsi": round(cur['rsi'], 2),
+        "atr": round(cur['atr'], 2),
+        "ema_50": round(cur['ema_50'], 2),
+        "ema_200": round(cur['ema_200'], 2),
+        "macd": round(cur['macd'], 2),
+        "macd_signal": round(cur['signal'], 2),
+        "adx": round(cur['adx'], 2),
+        "trend": "UP" if cur['close'] > cur['ema_200'] else "DOWN"
     }
 
 def calculate_weekly_trend(candles):
     if not candles or len(candles) < 40: return "UNKNOWN"
     try: data = [c.model_dump() for c in candles]
     except: data = [c.dict() for c in candles]
-        
     df = pd.DataFrame(data)
     df['close'] = df['close'].astype(float)
     df['ema_40'] = df['close'].ewm(span=40).mean()
