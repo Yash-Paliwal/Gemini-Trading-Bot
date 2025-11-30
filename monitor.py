@@ -6,14 +6,45 @@ from src.database import get_open_trades, update_trade_status, update_balance, g
 from src.tools import get_live_price, fetch_upstox_map
 from src.upstox_client import upstox_client
 
-def send_exit_alert(ticker, status, price, pnl, balance):
+# --- NEW FUNCTION: CALCULATE TOTAL NET WORTH ---
+def get_total_equity(master_map):
+    """Calculates Cash + Value of all Open Trades."""
+    cash = get_current_balance()
+    holdings_value = 0
+    
+    trades = get_open_trades()
+    for t in trades:
+        key = master_map.get(t.ticker)
+        if key:
+            price = get_live_price(key, symbol_fallback=t.ticker)
+            if price:
+                holdings_value += (price * t.quantity)
+            else:
+                # Fallback to entry price if live fails (conservative)
+                holdings_value += (t.entry_price * t.quantity)
+                
+    return cash + holdings_value
+
+def send_exit_alert(ticker, status, price, pnl, balance, total_equity):
     emoji = "💰" if pnl > 0 else "🛑"
+    
+    # Calculate % Return on this specific trade
+    # (Avoid division by zero)
+    roi = 0
+    if price > 0: 
+        # Approximate entry from PnL logic
+        # PnL = (Exit - Entry) * Qty
+        # We can just use the pnl to show raw profit
+        pass
+
     msg = (
         f"{emoji} *EXIT ALERT: {ticker}*\n"
         f"Status: {status}\n"
         f"Price: {price}\n"
-        f"P&L: {'+' if pnl>0 else ''}₹{pnl:.2f}\n"
-        f"🏦 Wallet: ₹{balance:,.0f}"
+        f"PnL: {'+' if pnl>0 else ''}₹{pnl:.2f}\n"
+        f"-------------------\n"
+        f"💵 Cash: ₹{balance:,.0f}\n"
+        f"🏛️ *Net Worth: ₹{total_equity:,.0f}*" 
     )
     try:
         requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"})
@@ -44,36 +75,30 @@ def run_watchdog():
             
         print(f"   👉 {t.ticker}: {current_price} (Tgt: {t.target_price} | Stop: {t.stop_loss})")
         
-        # CHECK EXIT
+        # CHECK CONDITIONS
         new_status = None
         if current_price >= t.target_price: new_status = "TARGET_HIT"
         elif current_price <= t.stop_loss: new_status = "STOP_HIT"
             
-        # CHECK TRAILING (Alert Only)
-        dist = t.target_price - t.entry_price
-        if dist > 0 and (current_price - t.entry_price)/dist > 0.5 and t.stop_loss < t.entry_price:
-             print(f"   🚀 {t.ticker} >50% to Target. Move Stop to Breakeven?")
-
         # EXECUTE EXIT
         if new_status:
-            # Calculate PnL
             pnl = (current_price - t.entry_price) * t.quantity
-            
-            # Calculate Refund (Entry Cost + Profit)
-            # Note: We deducted (Entry * Qty) initially.
-            # Now we add back (Exit * Qty).
             cash_back = current_price * t.quantity
             
             print(f"   ⚡ TRIGGER: {new_status} (PnL: {pnl:.2f})")
             
-            # 1. Update Wallet
+            # 1. Refund Wallet
             update_balance(cash_back)
             
             # 2. Close Trade in DB
             update_trade_status(t.id, new_status, current_price, pnl)
             
-            # 3. Alert
-            send_exit_alert(t.ticker, new_status, current_price, pnl, get_current_balance())
+            # 3. Calculate Total Equity (The New Feature)
+            # We calculate this AFTER the refund so 'Cash' is updated
+            total_equity = get_total_equity(master_map)
+            
+            # 4. Alert
+            send_exit_alert(t.ticker, new_status, current_price, pnl, get_current_balance(), total_equity)
 
     print("🏁 WATCHDOG SCAN COMPLETE.")
 
