@@ -16,7 +16,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.11' # Using 3.11 to match your local setup
+          python-version: '3.11' 
 
       - name: Install dependencies
         run: |
@@ -25,15 +25,12 @@ jobs:
 
       - name: Run Bot
         env:
-          # API Keys
           UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
           INDIANAPI_KEY: ${{ secrets.INDIANAPI_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          
-          # Telegram
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          
-          # Database (Supabase)
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          PAPER_MODE: ${{ secrets.PAPER_MODE }}
+        # 👇 FIXED: This is now aligned to the left (same level as 'env')
         run: python main.py
