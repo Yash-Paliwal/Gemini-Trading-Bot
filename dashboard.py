@@ -63,10 +63,7 @@ with st.sidebar:
     # 🚨 FIX: Simpler detection for Redirect URI
     # If running locally, use localhost. If cloud, use your app URL.
     # Update this string if you deploy to Streamlit Cloud!
-    if "localhost" in socket.gethostname() or "127.0.0.1" in socket.gethostbyname(socket.gethostname()):
-        redirect_uri = "http://localhost:8501"
-    else:
-        redirect_uri = "https://gemini-trading-bot-yash.streamlit.app" 
+    redirect_uri = "https://gemini-trading-bot-yash.streamlit.app" 
     
     if API_KEY and API_SECRET:
         # 1. Login Button
