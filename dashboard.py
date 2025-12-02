@@ -71,16 +71,16 @@ with st.sidebar:
     # 🧠 SMART URL DETECTION
     # Detects if running locally or on cloud to set the correct Redirect URI
     # Replace 'gemini-trading-bot-yash' with your actual Streamlit App Name if different
-    CLOUD_URL = "https://gemini-trading-bot-yash.streamlit.app"
+    redirect_uri = "https://gemini-trading-bot-yash.streamlit.app"
     
     # Logic: If localhost is in the URL bar, use localhost. Else use Cloud.
     # (Streamlit doesn't give easy access to current URL, so we infer from environment)
-    if os.getenv("STREAMLIT_SERVER_HEADLESS") == "true":
-        # Likely Cloud
-        redirect_uri = CLOUD_URL
-    else:
-        # Likely Local
-        redirect_uri = "http://localhost:8501"
+    # if os.getenv("STREAMLIT_SERVER_HEADLESS") == "true":
+    #     # Likely Cloud
+    #     redirect_uri = CLOUD_URL
+    # else:
+    #     # Likely Local
+        # redirect_uri = "http://localhost:8501"
     
     st.caption(f"Mode: {'☁️ Cloud' if redirect_uri == CLOUD_URL else '💻 Local'}")
     
