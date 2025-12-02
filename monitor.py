@@ -6,37 +6,22 @@ from src.database import get_open_trades, update_trade_status, update_balance, g
 from src.tools import get_live_price, fetch_upstox_map
 from src.upstox_client import upstox_client
 
-# --- NEW FUNCTION: CALCULATE TOTAL NET WORTH ---
 def get_total_equity(master_map):
     """Calculates Cash + Value of all Open Trades."""
     cash = get_current_balance()
     holdings_value = 0
-    
     trades = get_open_trades()
     for t in trades:
         key = master_map.get(t.ticker)
         if key:
             price = get_live_price(key, symbol_fallback=t.ticker)
-            if price:
-                holdings_value += (price * t.quantity)
-            else:
-                # Fallback to entry price if live fails (conservative)
-                holdings_value += (t.entry_price * t.quantity)
-                
+            # Fallback to entry price if live fails
+            val_price = price if price else t.entry_price
+            holdings_value += (val_price * t.quantity)
     return cash + holdings_value
 
 def send_exit_alert(ticker, status, price, pnl, balance, total_equity):
     emoji = "💰" if pnl > 0 else "🛑"
-    
-    # Calculate % Return on this specific trade
-    # (Avoid division by zero)
-    roi = 0
-    if price > 0: 
-        # Approximate entry from PnL logic
-        # PnL = (Exit - Entry) * Qty
-        # We can just use the pnl to show raw profit
-        pass
-
     msg = (
         f"{emoji} *EXIT ALERT: {ticker}*\n"
         f"Status: {status}\n"
@@ -53,14 +38,24 @@ def send_exit_alert(ticker, status, price, pnl, balance, total_equity):
 def run_watchdog():
     print("\n👮 STARTING WATCHDOG...")
     
-    upstox_client.set_access_token(UPSTOX_ACCESS_TOKEN)
+    # --- 1. SMART AUTHENTICATION ---
+    # Try .env token first
+    if UPSTOX_ACCESS_TOKEN:
+        upstox_client.set_access_token(UPSTOX_ACCESS_TOKEN)
+
+    # If invalid, try Database
     if not upstox_client.check_connection():
-        print("   ❌ Upstox Token Expired. Stopping.")
-        return
+        print("   ⚠️ Env Token Expired. Checking Database...")
+        if upstox_client.fetch_token_from_db():
+            print("   ✅ Loaded Fresh Token from Database!")
+        else:
+            print("   ❌ ALL TOKENS EXPIRED. Please login via Dashboard.")
+            return
+    # -------------------------------
 
     trades = get_open_trades()
     if not trades:
-        print("   💤 No open trades.")
+        print("   💤 No open trades to monitor.")
         return
 
     master_map = fetch_upstox_map()
@@ -68,36 +63,38 @@ def run_watchdog():
     
     for t in trades:
         key = master_map.get(t.ticker)
-        if not key: print(f"   ⚠️ Key missing for {t.ticker}"); continue
+        if not key: 
+            print(f"   ⚠️ Key missing for {t.ticker}")
+            continue
         
         current_price = get_live_price(key, symbol_fallback=t.ticker)
-        if not current_price: print(f"   ⚠️ Price unavailable for {t.ticker}"); continue
+        if not current_price: 
+            print(f"   ⚠️ Price unavailable for {t.ticker}")
+            continue
             
         print(f"   👉 {t.ticker}: {current_price} (Tgt: {t.target_price} | Stop: {t.stop_loss})")
         
-        # CHECK CONDITIONS
+        # Check Exits
         new_status = None
         if current_price >= t.target_price: new_status = "TARGET_HIT"
         elif current_price <= t.stop_loss: new_status = "STOP_HIT"
-            
-        # EXECUTE EXIT
+
+        # Trailing Stop Alert (Optional)
+        dist = t.target_price - t.entry_price
+        if dist > 0 and (current_price - t.entry_price)/dist > 0.5 and t.stop_loss < t.entry_price:
+             print(f"   🚀 {t.ticker} >50% to Target. Suggest Trailing Stop.")
+
         if new_status:
             pnl = (current_price - t.entry_price) * t.quantity
             cash_back = current_price * t.quantity
             
             print(f"   ⚡ TRIGGER: {new_status} (PnL: {pnl:.2f})")
             
-            # 1. Refund Wallet
             update_balance(cash_back)
-            
-            # 2. Close Trade in DB
             update_trade_status(t.id, new_status, current_price, pnl)
             
-            # 3. Calculate Total Equity (The New Feature)
-            # We calculate this AFTER the refund so 'Cash' is updated
+            # Calculate Equity for alert
             total_equity = get_total_equity(master_map)
-            
-            # 4. Alert
             send_exit_alert(t.ticker, new_status, current_price, pnl, get_current_balance(), total_equity)
 
     print("🏁 WATCHDOG SCAN COMPLETE.")

@@ -4,32 +4,25 @@ import requests
 import pandas as pd
 import streamlit as st
 from sqlalchemy import create_engine, text
-import socket
 
 # --- 1. CONFIGURATION ---
 st.set_page_config(page_title="Gemini Hedge Fund", layout="wide", page_icon="📈")
 
-# --- HYBRID SECRET LOADER ---
-# 1. Try Local .env / secrets.toml
+# Load Secrets
 try:
     DATABASE_URL = st.secrets["DATABASE_URL"]
     API_KEY = st.secrets.get("UPSTOX_API_KEY", "")
     API_SECRET = st.secrets.get("UPSTOX_API_SECRET", "")
+    # 🚨 NEW: Load Redirect URI from Secrets
+    REDIRECT_URI = st.secrets.get("REDIRECT_URI", "http://localhost:8501") 
 except FileNotFoundError:
-    # 2. Fallback to Environment Variables (Cloud/Docker)
-    DATABASE_URL = os.getenv("DATABASE_URL")
-    API_KEY = os.getenv("UPSTOX_API_KEY")
-    API_SECRET = os.getenv("UPSTOX_API_SECRET")
-
-if not DATABASE_URL:
-    st.error("❌ Configuration Missing: DATABASE_URL not found in secrets or env.")
+    st.error("❌ Secrets not found! Please create .streamlit/secrets.toml")
     st.stop()
 
 # --- 2. DATABASE CONNECTION ---
 @st.cache_resource
 def get_engine():
     url = DATABASE_URL
-    # Fix for Streamlit/SQLAlchemy compatibility
     if url.startswith("postgres://"):
         url = url.replace("postgres://", "postgresql://", 1)
     return create_engine(url, pool_pre_ping=True)
@@ -46,16 +39,13 @@ def get_data():
 def update_token_in_db(token):
     """Saves the fresh Upstox Token to the database."""
     with engine.connect() as conn:
-        # Create table if not exists (Safety)
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS api_tokens (
-                id SERIAL PRIMARY KEY,
-                provider TEXT UNIQUE,
+                provider TEXT PRIMARY KEY,
                 access_token TEXT,
                 updated_at TIMESTAMP DEFAULT NOW()
             )
         """))
-        # Upsert Token
         conn.execute(text("""
             INSERT INTO api_tokens (provider, access_token, updated_at)
             VALUES ('UPSTOX', :t, NOW())
@@ -64,29 +54,16 @@ def update_token_in_db(token):
         """), {"t": token})
         conn.commit()
 
-# --- 3. SIDEBAR: SMART LOGIN ---
+# --- 3. SIDEBAR: DAILY LOGIN ---
 with st.sidebar:
     st.header("🔐 Daily Login")
     
-    # 🧠 SMART URL DETECTION
-    # Detects if running locally or on cloud to set the correct Redirect URI
-    # Replace 'gemini-trading-bot-yash' with your actual Streamlit App Name if different
-    redirect_uri = "https://gemini-trading-bot-yash.streamlit.app"
-    
-    # Logic: If localhost is in the URL bar, use localhost. Else use Cloud.
-    # (Streamlit doesn't give easy access to current URL, so we infer from environment)
-    # if os.getenv("STREAMLIT_SERVER_HEADLESS") == "true":
-    #     # Likely Cloud
-    #     redirect_uri = CLOUD_URL
-    # else:
-    #     # Likely Local
-        # redirect_uri = "http://localhost:8501"
-    
-    # st.caption(f"Mode: {'☁️ Cloud' if redirect_uri == CLOUD_URL else '💻 Local'}")
+    # Debug Info (Optional - helpful to verify which URI is loaded)
+    # st.caption(f"Redirecting to: {REDIRECT_URI}")
     
     if API_KEY and API_SECRET:
         # 1. Login Button
-        auth_url = f"https://api.upstox.com/v2/login/authorization/dialog?response_type=code&client_id={API_KEY}&redirect_uri={redirect_uri}"
+        auth_url = f"https://api.upstox.com/v2/login/authorization/dialog?response_type=code&client_id={API_KEY}&redirect_uri={REDIRECT_URI}"
         st.link_button("1. Login to Upstox 🚀", auth_url, type="primary")
         
         # 2. Handle Redirect Code
@@ -103,24 +80,24 @@ with st.sidebar:
                             'code': auth_code,
                             'client_id': API_KEY,
                             'client_secret': API_SECRET,
-                            'redirect_uri': redirect_uri, # Must match exactly!
+                            'redirect_uri': REDIRECT_URI,
                             'grant_type': 'authorization_code',
                         }
                         resp = requests.post(url, headers=headers, data=data)
                         if resp.status_code == 200:
                             new_token = resp.json()['access_token']
                             update_token_in_db(new_token)
-                            st.success("✅ Token Saved! System Armed.")
+                            st.success("✅ Token Saved! Bot is armed.")
                             time.sleep(2)
                             st.query_params.clear()
                             st.rerun()
                         else:
                             st.error(f"Login Failed: {resp.text}")
-                            st.caption(f"Check Upstox App Settings. URI must match: {redirect_uri}")
+                            st.caption(f"Check Upstox App Settings. URI must match: {REDIRECT_URI}")
                     except Exception as e:
                         st.error(f"Error: {e}")
     else:
-        st.warning("⚠️ Credentials missing in Secrets.")
+        st.warning("⚠️ API Credentials missing in Secrets.")
 
     st.divider()
     if st.button('🔄 Refresh Data'):
@@ -135,7 +112,7 @@ except Exception as e:
     st.error(f"Database Connection Error: {e}")
     st.stop()
 
-# Metrics Calculation
+# Metrics
 if not portfolio.empty:
     cash_balance = float(portfolio.iloc[0]['balance'])
 else:
@@ -146,7 +123,6 @@ invested_capital = 0
 if not open_trades.empty:
     invested_capital = (open_trades['entry_price'] * open_trades['quantity']).sum()
 
-# Stats
 active_positions = len(open_trades)
 closed_trades = trades[trades['status'].str.contains('CLOSED', na=False) | trades['status'].str.contains('HIT', na=False)]
 total_closed = len(closed_trades)
@@ -155,7 +131,7 @@ win_rate = (winning_trades / total_closed * 100) if total_closed > 0 else 0
 total_realized_pnl = closed_trades['pnl'].sum() if not closed_trades.empty else 0
 net_worth = cash_balance + invested_capital
 
-# Display Top Row
+# Display Metrics
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("🏛️ Net Worth", f"₹{net_worth:,.0f}", delta=f"₹{total_realized_pnl:,.0f}")
 col2.metric("💵 Cash Available", f"₹{cash_balance:,.0f}")
@@ -164,7 +140,7 @@ col4.metric("🛡️ Active Risk", f"₹{invested_capital:,.0f}", f"{active_posi
 
 st.divider()
 
-# Active Positions Table
+# Active Positions
 st.subheader("🟢 Active Positions")
 if not open_trades.empty:
     display_open = open_trades[['ticker', 'entry_price', 'target_price', 'stop_loss', 'quantity', 'entry_time', 'reasoning']]
