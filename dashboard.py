@@ -82,7 +82,7 @@ with st.sidebar:
     #     # Likely Local
         # redirect_uri = "http://localhost:8501"
     
-    st.caption(f"Mode: {'☁️ Cloud' if redirect_uri == CLOUD_URL else '💻 Local'}")
+    # st.caption(f"Mode: {'☁️ Cloud' if redirect_uri == CLOUD_URL else '💻 Local'}")
     
     if API_KEY and API_SECRET:
         # 1. Login Button
