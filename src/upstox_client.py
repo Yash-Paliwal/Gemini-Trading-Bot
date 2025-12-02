@@ -1,19 +1,21 @@
 import requests
 import sys
+from sqlalchemy import text
+
+# 🚨 FIX: Import Session so we can talk to the database
+from src.database import Session 
 
 class UpstoxConnection:
     _instance = None  # Singleton instance
 
     def __new__(cls, *args, **kwargs):
-        """Ensures only ONE connection object exists in your entire app."""
+        """Ensures only ONE connection object exists."""
         if not cls._instance:
             cls._instance = super(UpstoxConnection, cls).__new__(cls, *args, **kwargs)
         return cls._instance
 
     def __init__(self):
-        # Prevent re-initialization if already created
-        if hasattr(self, 'initialized'):
-            return
+        if hasattr(self, 'initialized'): return
         
         self.access_token = None
         self.base_url = "https://api.upstox.com/v2"
@@ -23,71 +25,33 @@ class UpstoxConnection:
         }
         self.initialized = True
 
-    def fetch_token_from_db(self):
-        """Gets the latest token from Supabase."""
-        session = Session()
-        try:
-            result = session.execute(text("SELECT access_token FROM api_tokens WHERE provider = 'UPSTOX'"))
-            row = result.fetchone()
-            if row:
-                self.set_access_token(row[0])
-                print("✅ Loaded Access Token from Database.")
-                return True
-            return False
-        except Exception as e:
-            print(f"❌ Failed to fetch token from DB: {e}")
-            return False
-        finally:
-            session.close()
-
     def set_access_token(self, token):
-        """Call this once at the start of your program."""
         self.access_token = token
         self.headers['Authorization'] = f'Bearer {token}'
         print("✅ Access Token set globally.")
 
     def check_connection(self):
-        """
-        Pings the Upstox User Profile endpoint to check if the token is alive.
-        Returns: True if good, False if expired/bad.
-        """
-        if not self.access_token:
-            print("❌ Connection Error: No Access Token provided.")
-            return False
+        """Pings Upstox to check if token is valid."""
+        if not self.access_token: return False
 
-        endpoint = f"{self.base_url}/user/profile"
-        
         try:
-            response = requests.get(endpoint, headers=self.headers)
+            url = f"{self.base_url}/user/profile"
+            response = requests.get(url, headers=self.headers)
             
-            # Case 1: Success
             if response.status_code == 200:
-                user_data = response.json().get('data', {})
-                user_id = user_data.get('user_id', 'Unknown')
-                print(f"🟢 Upstox Connection is GOOD. Logged in as: {user_id}")
+                print(f"🟢 Upstox Connection is GOOD.")
                 return True
-            
-            # Case 2: Token Expired or Invalid
-            error_data = response.json()
-            errors = error_data.get('errors', [])
-            
-            # Check for specific Upstox error code for expired token
-            for err in errors:
-                if err.get('errorCode') == 'UDAPI100050':
-                    print("🔴 Connection Failed: TOKEN EXPIRED. Please generate a new one.")
-                    return False
-            
-            # Case 3: Other Errors
-            print(f"⚠️ Connection Issue. Status: {response.status_code}")
-            print(f"   Reason: {error_data}")
-            return False
-
+            elif response.status_code == 401:
+                print("🔴 Connection Failed: TOKEN EXPIRED.")
+                return False
+            else:
+                print(f"⚠️ Connection Issue: {response.status_code}")
+                return False
         except Exception as e:
-            print(f"❌ Network Error: Could not reach Upstox. {e}")
+            print(f"❌ Network Error: {e}")
             return False
 
     def get_session(self):
-        """Returns a configured requests session for use in other files."""
         if not self.access_token:
             raise ValueError("Upstox Access Token not set! Call set_access_token() first.")
         
@@ -95,5 +59,28 @@ class UpstoxConnection:
         session.headers.update(self.headers)
         return session
 
-# Create a global instance
+    def fetch_token_from_db(self):
+        """Gets the latest token from Supabase (Fallback Method)."""
+        # This line caused the error before because Session wasn't imported
+        session = Session() 
+        try:
+            # Fetch token where provider is 'UPSTOX'
+            result = session.execute(text("SELECT access_token FROM api_tokens WHERE provider = 'UPSTOX'"))
+            row = result.fetchone()
+            
+            if row:
+                self.set_access_token(row[0])
+                print("✅ Loaded Access Token from Database.")
+                return True
+            
+            print("   ⚠️ No token found in Database.")
+            return False
+            
+        except Exception as e:
+            print(f"❌ Failed to fetch token from DB: {e}")
+            return False
+        finally:
+            session.close()
+
+# Create global instance
 upstox_client = UpstoxConnection()
