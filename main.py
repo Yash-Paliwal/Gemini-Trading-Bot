@@ -55,14 +55,26 @@ def send_telegram_alert(t, qty, live_price, wallet_bal):
 def run_bot():
     mode_label = "📝 PAPER MODE" if PAPER_MODE else "💸 REAL MONEY MODE"
     print(f"\n🤖 STARTING HEDGE FUND ENGINE ({mode_label})...")
-    print(f"   🕒 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-
-    # 1. SYSTEM HEALTH CHECK
+    
+    # 1. SMART AUTHENTICATION (The Final Link)
     print("🔌 Connecting to Upstox...", end=" ")
-    upstox_client.set_access_token(UPSTOX_ACCESS_TOKEN)
-    if upstox_client.check_connection(): print("✅ Connection Good.")
-    else:
-        print("❌ Upstox Connection Failed. STOPPING.")
+    
+    # A. Try GitHub Secret First
+    if UPSTOX_ACCESS_TOKEN:
+        upstox_client.set_access_token(UPSTOX_ACCESS_TOKEN)
+    
+    # B. If Secret is missing or expired, Try Database
+    if not upstox_client.check_connection():
+        print("   ⚠️ Secret Token Invalid. Checking Database...")
+        if upstox_client.fetch_token_from_db():
+            print("   ✅ Loaded Fresh Token from Database!")
+        else:
+            print("   ❌ Database Token Missing/Expired.")
+            
+    # Final Check
+    if not upstox_client.check_connection():
+        print("❌ CRITICAL FAIL: No valid token found anywhere. STOPPING.")
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": "🔴 *AUTH FAILED*: Please Login via Dashboard!", "parse_mode": "Markdown"})
         return
 
     print("🔌 Testing Database...", end=" ")
