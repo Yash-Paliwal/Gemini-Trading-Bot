@@ -23,6 +23,23 @@ class UpstoxConnection:
         }
         self.initialized = True
 
+    def fetch_token_from_db(self):
+        """Gets the latest token from Supabase."""
+        session = Session()
+        try:
+            result = session.execute(text("SELECT access_token FROM api_tokens WHERE provider = 'UPSTOX'"))
+            row = result.fetchone()
+            if row:
+                self.set_access_token(row[0])
+                print("✅ Loaded Access Token from Database.")
+                return True
+            return False
+        except Exception as e:
+            print(f"❌ Failed to fetch token from DB: {e}")
+            return False
+        finally:
+            session.close()
+
     def set_access_token(self, token):
         """Call this once at the start of your program."""
         self.access_token = token
