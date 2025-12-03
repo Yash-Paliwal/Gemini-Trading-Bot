@@ -21,25 +21,33 @@ def get_market_volatility():
 
 def calculate_position_size(entry, stop_loss):
     """
-    Calculates quantity based on VIX-adjusted risk.
+    Calculates quantity based on Risk AND Max Allocation.
     """
     try:
-        # 1. Adjust Risk based on Market Mood
-        volatility_factor = get_market_volatility()
-        adjusted_risk_money = ACCOUNT_SIZE * RISK_PER_TRADE * volatility_factor
-        
-        # 2. Calculate Risk per Share
         entry = float(entry)
         stop_loss = float(stop_loss)
-        risk_per_share = entry - stop_loss
         
-        if risk_per_share <= 0: return 0
+        # 1. Risk-Based Sizing (The "Math" Limit)
+        risk_per_share = abs(entry - stop_loss) # abs() handles Short trades too
+        if risk_per_share == 0: return 0
         
-        # 3. Final Quantity
-        qty = int(adjusted_risk_money / risk_per_share)
+        volatility_factor = get_market_volatility()
+        risk_budget = ACCOUNT_SIZE * RISK_PER_TRADE * volatility_factor
+        qty_by_risk = int(risk_budget / risk_per_share)
         
-        if volatility_factor < 1.0:
-            print(f"   🛡️ Risk reduced by {(1-volatility_factor)*100}% (High VIX).")
+        # 2. Capital-Based Sizing (The "Wallet" Limit)
+        # We never want to put more than 20% of the account in one stock
+        max_capital_allowed = ACCOUNT_SIZE * MAX_POSITION_ALLOCATION
+        qty_by_capital = int(max_capital_allowed / entry)
+        
+        # 3. The Final Decision (Take the smaller number)
+        final_qty = min(qty_by_risk, qty_by_capital)
+        
+        # Debug Log
+        if qty_by_risk > qty_by_capital:
+            print(f"   🛡️ Capped by Max Allocation (Risk Qty: {qty_by_risk} -> Cap Qty: {qty_by_capital})")
             
-        return qty
-    except: return 0
+        return final_qty
+    except Exception as e:
+        print(f"Risk Calc Error: {e}")
+        return 0
