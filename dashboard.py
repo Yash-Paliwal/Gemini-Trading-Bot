@@ -7,6 +7,7 @@ import streamlit.components.v1 as components
 import altair as alt
 from sqlalchemy import create_engine, text
 import socket
+import hmac
 
 # --- IMPORTS ---
 from src.upstox_client import upstox_client
@@ -21,6 +22,38 @@ st.markdown("""
     .stDataFrame { border-radius: 10px; overflow: hidden; }
 </style>
 """, unsafe_allow_html=True)
+
+# --- 🔒 AUTHENTICATION SYSTEM ---
+def check_password():
+    """Returns `True` if the user had the correct password."""
+
+    def password_entered():
+        """Checks whether a password entered by the user is correct."""
+        if hmac.compare_digest(st.session_state["password"], st.secrets["APP_PASSWORD"]):
+            st.session_state["password_correct"] = True
+            del st.session_state["password"]  # Don't store the password
+        else:
+            st.session_state["password_correct"] = False
+
+    # 1. Check if password already verified
+    if st.session_state.get("password_correct", False):
+        return True
+
+    # 2. Show Input Box
+    st.title("🔐 Gemini Hedge Fund")
+    st.text_input(
+        "Enter Access PIN", type="password", on_change=password_entered, key="password"
+    )
+    
+    # 3. Handle Errors
+    if "password_correct" in st.session_state:
+        st.error("❌ Access Denied")
+    
+    return False
+
+# 🛑 STOP EVERYTHING IF PASSWORD FAILS
+if not check_password():
+    st.stop()
 
 # Load Secrets
 try:
