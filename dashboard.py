@@ -5,18 +5,22 @@ import pandas as pd
 import streamlit as st
 from sqlalchemy import create_engine, text
 import socket
-import altair as alt
+
+# --- NEW IMPORTS FOR LIVE DATA ---
+from src.upstox_client import upstox_client
+from src.tools import get_live_price, fetch_upstox_map
 
 # --- 1. CONFIGURATION ---
 st.set_page_config(page_title="Gemini Hedge Fund", layout="wide", page_icon="📈")
 
-# Load Secrets (Hybrid Method)
+# Load Secrets
 try:
     DATABASE_URL = st.secrets["DATABASE_URL"]
     API_KEY = st.secrets.get("UPSTOX_API_KEY", "")
     API_SECRET = st.secrets.get("UPSTOX_API_SECRET", "")
 except FileNotFoundError:
-    from src.config import DATABASE_URL # Import from local config if secrets missing
+    # Fallback for local dev without secrets.toml
+    DATABASE_URL = os.getenv("DATABASE_URL")
     API_KEY = os.getenv("UPSTOX_API_KEY")
     API_SECRET = os.getenv("UPSTOX_API_SECRET")
 
@@ -59,7 +63,7 @@ def update_token_in_db(token):
 
 # --- 3. SIDEBAR: LOGIN ---
 with st.sidebar:
-    st.header("🔐 Fund Access")
+    st.header("🔐 Daily Login")
     
     # Smart Redirect
     if "localhost" in socket.gethostname() or "127.0.0.1" in socket.gethostbyname(socket.gethostname()):
@@ -92,64 +96,111 @@ with st.sidebar:
     st.divider()
     if st.button('🔄 Refresh Data'): st.rerun()
 
-# --- 4. MAIN DASHBOARD ---
+# --- 4. DASHBOARD LOGIC ---
 st.title("🤖 Gemini AI Hedge Fund")
-st.caption("Automated Swing Trading System • Multi-Strategy • Risk Managed")
+st.caption("Live P&L Monitor")
 
+# A. Connect to DB
 try:
     trades, portfolio = get_data()
 except:
     st.warning("Waiting for Database connection...")
     st.stop()
 
-# METRICS
+# B. Authenticate Upstox (For Live Prices)
+is_live = False
+if upstox_client.fetch_token_from_db():
+    is_live = True
+else:
+    st.warning("⚠️ Upstox Token Expired. Prices may be stale. Please Login in Sidebar.")
+
+# C. Calculate Real-Time Metrics
 cash = float(portfolio.iloc[0]['balance']) if not portfolio.empty else 0.0
 open_trades = trades[trades['status'] == 'OPEN'].copy()
-invested = (open_trades['entry_price'] * open_trades['quantity']).sum() if not open_trades.empty else 0
-net_worth = cash + invested
 
+total_invested_cost = 0
+current_holdings_value = 0
+total_unrealized_pnl = 0
+
+if not open_trades.empty:
+    # Load Map for Live Prices
+    master_map = fetch_upstox_map() if is_live else {}
+    
+    # Create columns for live data
+    live_prices = []
+    current_values = []
+    pnls = []
+    
+    for index, row in open_trades.iterrows():
+        entry = row['entry_price']
+        qty = row['quantity']
+        ticker = row['ticker']
+        
+        # Fetch Live Price
+        current_price = entry # Default to entry if offline
+        if is_live:
+            key = master_map.get(ticker)
+            if key:
+                lp = get_live_price(key, ticker)
+                if lp: current_price = lp
+        
+        # Math
+        val = current_price * qty
+        pnl = val - (entry * qty)
+        
+        live_prices.append(current_price)
+        current_values.append(val)
+        pnls.append(pnl)
+        
+    # Add to DataFrame
+    open_trades['Live Price'] = live_prices
+    open_trades['Current Value'] = current_values
+    open_trades['P&L'] = pnls
+    
+    # Totals
+    total_invested_cost = (open_trades['entry_price'] * open_trades['quantity']).sum()
+    current_holdings_value = sum(current_values)
+    total_unrealized_pnl = sum(pnls)
+
+# D. Final Metrics
+net_worth = cash + current_holdings_value
 closed = trades[trades['status'].str.contains('CLOSED|HIT', na=False)]
 realized_pnl = closed['pnl'].sum() if not closed.empty else 0
-win_rate = (len(closed[closed['pnl'] > 0]) / len(closed) * 100) if not closed.empty else 0
+total_pnl = realized_pnl + total_unrealized_pnl
 
-# TOP METRICS ROW
+# --- 5. DISPLAY ---
+
+# Top Row
 m1, m2, m3, m4 = st.columns(4)
-m1.metric("🏛️ AUM (Net Worth)", f"₹{net_worth:,.0f}", delta=f"₹{realized_pnl:,.0f}")
-m2.metric("💵 Cash", f"₹{cash:,.0f}")
-m3.metric("🛡️ Invested", f"₹{invested:,.0f}")
-m4.metric("🎯 Win Rate", f"{win_rate:.0f}%", f"{len(closed)} Trades")
+m1.metric("🏛️ Net Worth", f"₹{net_worth:,.0f}", delta=f"{total_unrealized_pnl:+.0f} (Today)")
+m2.metric("💵 Liquid Cash", f"₹{cash:,.0f}")
+m3.metric("🛡️ Invested", f"₹{current_holdings_value:,.0f}")
+m4.metric("💰 Total Profit", f"₹{total_pnl:,.0f}", delta=f"Realized: {realized_pnl:.0f}")
 
 st.divider()
 
-# ACTIVE POSITIONS
-col_table, col_chart = st.columns([2, 1])
+# Active Positions Table
+st.subheader("🟢 Active Positions")
+if not open_trades.empty:
+    # Format for display
+    view = open_trades[['ticker', 'quantity', 'entry_price', 'Live Price', 'Current Value', 'P&L', 'stop_loss', 'target_price']].copy()
+    
+    # Add colors to P&L column logic would go here in advanced streamlit, 
+    # for now standard dataframe is fine.
+    st.dataframe(
+        view.style.format({
+            'entry_price': '₹{:.2f}',
+            'Live Price': '₹{:.2f}',
+            'Current Value': '₹{:.0f}',
+            'P&L': '₹{:.2f}',
+            'stop_loss': '₹{:.2f}',
+            'target_price': '₹{:.2f}'
+        }), 
+        use_container_width=True
+    )
+else:
+    st.info("No active trades.")
 
-with col_table:
-    st.subheader("🟢 Active Positions")
-    if not open_trades.empty:
-        view = open_trades[['ticker', 'entry_price', 'target_price', 'stop_loss', 'quantity', 'reasoning']]
-        st.dataframe(view, use_container_width=True, hide_index=True)
-    else:
-        st.info("No active trades. Scanning market...")
-
-with col_chart:
-    st.subheader("📊 Capital Allocation")
-    if invested > 0:
-        # Simple Pie Chart of Allocation
-        alloc_data = pd.DataFrame({
-            'Asset': ['Cash', 'Stocks'],
-            'Value': [cash, invested]
-        })
-        c = alt.Chart(alloc_data).mark_arc(innerRadius=50).encode(
-            theta=alt.Theta("Value", stack=True),
-            color=alt.Color("Asset"),
-            tooltip=["Asset", "Value"]
-        )
-        st.altair_chart(c, use_container_width=True)
-    else:
-        st.caption("100% Cash")
-
-# PERFORMANCE HISTORY
-st.subheader("📜 Trade History")
-if not trades.empty:
+# Trade History
+with st.expander("📜 Trade History"):
     st.dataframe(trades, use_container_width=True)
