@@ -7,7 +7,6 @@ import streamlit.components.v1 as components
 import altair as alt
 from sqlalchemy import create_engine, text
 import socket
-import hmac
 
 # --- IMPORTS ---
 from src.upstox_client import upstox_client
@@ -23,39 +22,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- 🔒 AUTHENTICATION SYSTEM ---
-def check_password():
-    """Returns `True` if the user had the correct password."""
-
-    def password_entered():
-        """Checks whether a password entered by the user is correct."""
-        if hmac.compare_digest(st.session_state["password"], st.secrets["APP_PASSWORD"]):
-            st.session_state["password_correct"] = True
-            del st.session_state["password"]  # Don't store the password
-        else:
-            st.session_state["password_correct"] = False
-
-    # 1. Check if password already verified
-    if st.session_state.get("password_correct", False):
-        return True
-
-    # 2. Show Input Box
-    st.title("🔐 Gemini Hedge Fund")
-    st.text_input(
-        "Enter Access PIN", type="password", on_change=password_entered, key="password"
-    )
-    
-    # 3. Handle Errors
-    if "password_correct" in st.session_state:
-        st.error("❌ Access Denied")
-    
-    return False
-
-# 🛑 STOP EVERYTHING IF PASSWORD FAILS
-if not check_password():
-    st.stop()
-
-# Load Secrets
+# Load Secrets (Hybrid Approach: Local .env or Cloud Secrets)
 try:
     DATABASE_URL = st.secrets["DATABASE_URL"]
     API_KEY = st.secrets.get("UPSTOX_API_KEY", "")
@@ -68,13 +35,14 @@ except FileNotFoundError:
     REDIRECT_URI = os.getenv("REDIRECT_URI", "http://localhost:8501")
 
 if not DATABASE_URL:
-    st.error("❌ Database URL missing!")
+    st.error("❌ Database URL missing! Add it to Streamlit Secrets.")
     st.stop()
 
-# --- 2. DATABASE ---
+# --- 2. DATABASE CONNECTION ---
 @st.cache_resource
 def get_engine():
     url = DATABASE_URL
+    # Fix for Streamlit/SQLAlchemy compatibility
     if url.startswith("postgres://"):
         url = url.replace("postgres://", "postgresql://", 1)
     return create_engine(url, pool_pre_ping=True)
@@ -82,24 +50,25 @@ def get_engine():
 engine = get_engine()
 
 def get_data():
+    """Fetches Trades and Portfolio data from Supabase."""
     with engine.connect() as conn:
         trades_df = pd.read_sql("SELECT * FROM trades ORDER BY entry_time DESC", conn)
         portfolio_df = pd.read_sql("SELECT * FROM portfolio", conn)
     return trades_df, portfolio_df
 
 def update_token_in_db(token):
+    """Saves the fresh Upstox Token to the database."""
     with engine.connect() as conn:
         conn.execute(text("CREATE TABLE IF NOT EXISTS api_tokens (provider TEXT PRIMARY KEY, access_token TEXT, updated_at TIMESTAMP DEFAULT NOW())"))
         conn.execute(text("INSERT INTO api_tokens (provider, access_token, updated_at) VALUES ('UPSTOX', :t, NOW()) ON CONFLICT (provider) DO UPDATE SET access_token = EXCLUDED.access_token, updated_at = NOW()"), {"t": token})
         conn.commit()
 
-# --- HELPER: TRADINGVIEW WIDGET (FIXED) ---
+# --- HELPER: TRADINGVIEW WIDGET (BSE FIX) ---
 def render_tradingview_chart(symbol):
-    # 1. Remove .NS extension
+    # 1. Remove Yahoo extension
     clean_symbol = symbol.replace(".NS", "")
     
-    # 2. 🚨 FIX: Use 'BSE' instead of 'NSE' to bypass embedding restriction
-    # Most Indian stocks are listed on both. BSE charts work on embedded sites.
+    # 2. Use BSE (Bombay Stock Exchange) to bypass NSE restrictions
     tv_symbol = f"BSE:{clean_symbol}"
     
     html_code = f"""
@@ -107,41 +76,37 @@ def render_tradingview_chart(symbol):
       <div id="tradingview_{clean_symbol}"></div>
       <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
       <script type="text/javascript">
-      new TradingView.widget(
-      {{
-        "width": "100%",
-        "height": 500,
+      new TradingView.widget({{
+        "width": "100%", "height": 500, 
         "symbol": "{tv_symbol}", 
         "interval": "D",
-        "timezone": "Asia/Kolkata",
-        "theme": "light",
-        "style": "1",
-        "locale": "in",
-        "toolbar_bg": "#f1f3f6",
-        "enable_publishing": false,
+        "timezone": "Asia/Kolkata", "theme": "light", "style": "1", "locale": "in",
+        "toolbar_bg": "#f1f3f6", "enable_publishing": false, 
         "allow_symbol_change": true,
         "container_id": "tradingview_{clean_symbol}"
-      }}
-      );
+      }});
       </script>
     </div>
     """
     components.html(html_code, height=500)
 
-# --- 3. SIDEBAR ---
+# --- 3. SIDEBAR: DAILY LOGIN ---
 with st.sidebar:
     st.header("🔐 Daily Login")
     
-    # Determine Redirect URI
+    # Smart Redirect Detection
+    # If running locally (localhost), use localhost. Else use Configured Cloud URI.
     if "localhost" in socket.gethostname() or "127.0.0.1" in socket.gethostbyname(socket.gethostname()):
         final_redirect_uri = "http://localhost:8501"
     else:
-        final_redirect_uri = "https://gemini-trading-bot-yash.streamlit.app"
+        # If REDIRECT_URI is set in secrets, use it. Otherwise fallback.
+        final_redirect_uri = REDIRECT_URI if REDIRECT_URI else "https://gemini-trading-bot-yash.streamlit.app"
     
     if API_KEY and API_SECRET:
         auth_url = f"https://api.upstox.com/v2/login/authorization/dialog?response_type=code&client_id={API_KEY}&redirect_uri={final_redirect_uri}"
         st.link_button("1. Login to Upstox 🚀", auth_url, type="primary")
         
+        # Handle Code from Redirect
         auth_code = st.query_params.get("code")
         if auth_code:
             if st.button("2. Generate Token 🔑"):
@@ -170,66 +135,64 @@ except Exception as e: st.error(f"DB Error: {e}"); st.stop()
 cash = float(portfolio.iloc[0]['balance']) if not portfolio.empty else 0.0
 open_trades = trades[trades['status'] == 'OPEN'].copy()
 
-# 🚨 FIX: PRE-INITIALIZE COLUMNS WITH DEFAULT VALUES 🚨
-# This ensures columns exist even if API calls fail later
+# Initialize Defaults to prevent KeyErrors
+total_invested_cost = 0
+current_holdings_value = 0
+total_unrealized_pnl = 0
+invested = 0
+
+# -- FETCH LIVE DATA --
 if not open_trades.empty:
+    # Pre-fill columns with static data first
     open_trades['Live Price'] = open_trades['entry_price']
     open_trades['PnL'] = 0.0
     open_trades['PnL %'] = 0.0
     open_trades['Current Value'] = open_trades['entry_price'] * open_trades['quantity']
 
-# -- FETCH LIVE DATA --
-is_live = upstox_client.fetch_token_from_db()
-
-if is_live and not open_trades.empty:
-    master_map = fetch_upstox_map()
+    # Try to fetch live data
+    is_live = upstox_client.fetch_token_from_db()
     
-    # Lists to hold updated values
-    live_prices = []
-    pnls = []
-    current_values = []
-    
-    for index, row in open_trades.iterrows():
-        key = master_map.get(row['ticker'])
+    if is_live:
+        master_map = fetch_upstox_map()
+        live_prices, pnls, current_values = [], [], []
         
-        # Get Price (or fallback to entry)
-        current_price = row['entry_price']
-        if key:
-            lp = get_live_price(key, row['ticker'])
-            if lp: current_price = lp
+        for index, row in open_trades.iterrows():
+            current_price = row['entry_price']
+            key = master_map.get(row['ticker'])
+            
+            if key:
+                lp = get_live_price(key, row['ticker'])
+                if lp: current_price = lp
+            
+            val = current_price * row['quantity']
+            pnl = val - (row['entry_price'] * row['quantity'])
+            
+            live_prices.append(current_price)
+            current_values.append(val)
+            pnls.append(pnl)
         
-        # Calc Stats
-        val = current_price * row['quantity']
-        pnl = val - (row['entry_price'] * row['quantity'])
+        # Update DataFrame
+        open_trades['Live Price'] = live_prices
+        open_trades['PnL'] = pnls
+        open_trades['Current Value'] = current_values
+        open_trades['PnL %'] = ((open_trades['Live Price'] - open_trades['entry_price']) / open_trades['entry_price']) * 100
         
-        live_prices.append(current_price)
-        pnls.append(pnl)
-        current_values.append(val)
-    
-    # Assign lists back to DataFrame
-    open_trades['Live Price'] = live_prices
-    open_trades['PnL'] = pnls
-    open_trades['Current Value'] = current_values
-    open_trades['PnL %'] = ((open_trades['Live Price'] - open_trades['entry_price']) / open_trades['entry_price']) * 100
-
-elif not is_live:
-    st.warning("⚠️ Upstox Token Expired. Showing static data.")
+        current_holdings_value = sum(current_values)
+        total_unrealized_pnl = sum(pnls)
+        invested = (open_trades['entry_price'] * open_trades['quantity']).sum()
+    else:
+        st.warning("⚠️ Upstox Token Expired. Showing Entry Prices. Please Login.")
+        invested = (open_trades['entry_price'] * open_trades['quantity']).sum()
+        current_holdings_value = invested
 
 # -- FINAL METRICS --
-if not open_trades.empty:
-    invested = open_trades['Current Value'].sum()
-    total_unrealized_pnl = open_trades['PnL'].sum()
-else:
-    invested = 0
-    total_unrealized_pnl = 0
-
+net_worth = cash + current_holdings_value
 closed = trades[trades['status'].str.contains('CLOSED|HIT', na=False)]
 realized_pnl = closed['pnl'].sum() if not closed.empty else 0
 total_pnl = realized_pnl + total_unrealized_pnl
 closed_count = len(closed)
 win_count = len(closed[closed['pnl'] > 0])
 win_rate = (win_count / closed_count * 100) if closed_count > 0 else 0
-net_worth = cash + invested
 
 # DISPLAY
 m1, m2, m3, m4 = st.columns(4)
@@ -259,12 +222,12 @@ with tab1:
 with tab2:
     st.subheader("🟢 Live Positions")
     if not open_trades.empty:
-        # Now this safe because columns are pre-initialized
         view = open_trades[['ticker', 'quantity', 'entry_price', 'Live Price', 'target_price', 'stop_loss', 'PnL', 'PnL %']].copy()
         st.dataframe(view.style.format({'entry_price': '₹{:.2f}', 'Live Price': '₹{:.2f}', 'target_price': '₹{:.2f}', 'stop_loss': '₹{:.2f}', 'PnL': '₹{:.2f}', 'PnL %': '{:.2f}%'}), use_container_width=True)
         
         st.divider()
         st.markdown("### 🕯️ Live Charts")
+        # Show charts for all open trades
         tabs = st.tabs(open_trades['ticker'].tolist())
         for i, tab in enumerate(tabs):
             with tab:
