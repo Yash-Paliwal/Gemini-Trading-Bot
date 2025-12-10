@@ -1,103 +1,78 @@
-import time
-import requests
-import json
-from src.config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, UPSTOX_ACCESS_TOKEN
-from src.database import get_open_trades, update_trade_status, update_balance, get_current_balance
+import sys
+from src.database import get_open_trades
 from src.tools import get_live_price, fetch_upstox_map
 from src.upstox_client import upstox_client
 
-def get_total_equity(master_map):
-    """Calculates Cash + Value of all Open Trades."""
-    cash = get_current_balance()
-    holdings_value = 0
-    trades = get_open_trades()
-    for t in trades:
-        key = master_map.get(t.ticker)
-        if key:
-            price = get_live_price(key, symbol_fallback=t.ticker)
-            # Fallback to entry price if live fails
-            val_price = price if price else t.entry_price
-            holdings_value += (val_price * t.quantity)
-    return cash + holdings_value
+# --- MODULAR IMPORTS ---
+from src.bot.executor import execute_exit
+from src.bot.telegram import send_exit_alert
 
-def send_exit_alert(ticker, status, price, pnl, balance, total_equity):
-    emoji = "💰" if pnl > 0 else "🛑"
-    msg = (
-        f"{emoji} *EXIT ALERT: {ticker}*\n"
-        f"Status: {status}\n"
-        f"Price: {price}\n"
-        f"PnL: {'+' if pnl>0 else ''}₹{pnl:.2f}\n"
-        f"-------------------\n"
-        f"💵 Cash: ₹{balance:,.0f}\n"
-        f"🏛️ *Net Worth: ₹{total_equity:,.0f}*" 
-    )
-    try:
-        requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"})
-    except: pass
+def get_val(obj, key):
+    """Helper to safely get value from either a Dict or an Object."""
+    if isinstance(obj, dict):
+        return obj.get(key)
+    return getattr(obj, key, None)
 
 def run_watchdog():
-    print("\n👮 STARTING WATCHDOG...")
+    print("\n👮 STARTING MULTI-STRATEGY WATCHDOG (Single Scan)...")
     
-    # --- 1. SMART AUTHENTICATION ---
-    # Try .env token first
-    if UPSTOX_ACCESS_TOKEN:
-        upstox_client.set_access_token(UPSTOX_ACCESS_TOKEN)
-
-    # If invalid, try Database
+    # 1. Auth Check
     if not upstox_client.check_connection():
-        print("   ⚠️ Env Token Expired. Checking Database...")
-        if upstox_client.fetch_token_from_db():
-            print("   ✅ Loaded Fresh Token from Database!")
-        else:
-            print("   ❌ ALL TOKENS EXPIRED. Please login via Dashboard.")
+        # Try loading from DB if Env var is missing
+        if upstox_client.fetch_token_from_db(): 
+            print("   ✅ Token Loaded from DB.")
+        else: 
+            print("   ❌ No Token. Exiting.")
             return
-    # -------------------------------
 
-    trades = get_open_trades()
+    # 2. Get Data
+    trades = get_open_trades(strategy_name=None)
     if not trades:
-        print("   💤 No open trades to monitor.")
+        print("   💤 No active trades to monitor.")
         return
 
     master_map = fetch_upstox_map()
     print(f"   🔍 Monitoring {len(trades)} Positions...")
     
     for t in trades:
-        key = master_map.get(t.ticker)
-        if not key: 
-            print(f"   ⚠️ Key missing for {t.ticker}")
-            continue
+        ticker = get_val(t, 'ticker')
+        strategy = get_val(t, 'strategy_name') or 'MASTER'
+        trade_id = get_val(t, 'id')
+        stop_loss = get_val(t, 'stop_loss')
+        target_price = get_val(t, 'target_price')
+        quantity = get_val(t, 'quantity')
+        entry_price = get_val(t, 'entry_price')
         
-        current_price = get_live_price(key, symbol_fallback=t.ticker)
-        if not current_price: 
-            print(f"   ⚠️ Price unavailable for {t.ticker}")
-            continue
+        # 3. Get Price
+        key = master_map.get(ticker)
+        if not key: continue
+        
+        current_price = get_live_price(key, ticker)
+        if not current_price: continue
             
-        print(f"   👉 {t.ticker}: {current_price} (Tgt: {t.target_price} | Stop: {t.stop_loss})")
-        
-        # Check Exits
+        # 4. Check Rules
         new_status = None
-        if current_price >= t.target_price: new_status = "TARGET_HIT"
-        elif current_price <= t.stop_loss: new_status = "STOP_HIT"
+        if current_price <= stop_loss: new_status = "STOP_HIT"
+        elif current_price >= target_price: new_status = "TARGET_HIT"
 
-        # Trailing Stop Alert (Optional)
-        dist = t.target_price - t.entry_price
-        if dist > 0 and (current_price - t.entry_price)/dist > 0.5 and t.stop_loss < t.entry_price:
-             print(f"   🚀 {t.ticker} >50% to Target. Suggest Trailing Stop.")
-
+        # 5. Delegate Execution
         if new_status:
-            pnl = (current_price - t.entry_price) * t.quantity
-            cash_back = current_price * t.quantity
-            
-            print(f"   ⚡ TRIGGER: {new_status} (PnL: {pnl:.2f})")
-            
-            update_balance(cash_back)
-            update_trade_status(t.id, new_status, current_price, pnl)
-            
-            # Calculate Equity for alert
-            total_equity = get_total_equity(master_map)
-            send_exit_alert(t.ticker, new_status, current_price, pnl, get_current_balance(), total_equity)
+            pnl, new_bal = execute_exit(
+                trade_id=trade_id,
+                ticker=ticker,
+                strategy_name=strategy,
+                quantity=quantity,
+                entry_price=entry_price,
+                exit_price=current_price,
+                status=new_status
+            )
+            send_exit_alert(ticker, strategy, new_status, current_price, pnl, new_bal)
 
-    print("🏁 WATCHDOG SCAN COMPLETE.")
+    print("🏁 SCAN COMPLETE.")
 
 if __name__ == "__main__":
-    run_watchdog()
+    # No loops, no arguments. Just run once and die.
+    try:
+        run_watchdog()
+    except Exception as e:
+        print(f"   ❌ Watchdog Error: {e}")

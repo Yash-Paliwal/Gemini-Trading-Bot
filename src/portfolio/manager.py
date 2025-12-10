@@ -2,8 +2,8 @@ import yfinance as yf
 from src.database import get_open_trades
 
 # --- PORTFOLIO RULES ---
-MAX_SECTOR_EXPOSURE = 2   # Max 2 stocks per sector (e.g., Only 2 Banks)
-MAX_TOTAL_POSITIONS = 10  # Max 10 open trades at a time
+MAX_SECTOR_EXPOSURE = 2   # Max 2 stocks per sector (Per Strategy)
+MAX_POSITIONS_PER_STRATEGY = 5  # Max 5 open trades per strategy (Total 15 for 3 strategies)
 
 def get_sector(ticker):
     """
@@ -19,44 +19,45 @@ def get_sector(ticker):
         print(f"      ⚠️ Sector fetch failed for {ticker}: {e}")
         return 'Unknown'
 
-def check_portfolio_health(new_candidate):
+def check_portfolio_health(new_candidate, strategy_name):
     """
-    Checks if adding this stock violates any portfolio rules.
+    Checks if THIS SPECIFIC STRATEGY is allowed to buy this stock.
     Returns: (Allowed: bool, Reason: str)
     """
-    # 1. Get Current Portfolio
-    open_trades = get_open_trades()
+    # 1. Get Open Trades for THIS Strategy Only
+    # (We rely on the database function we updated earlier)
+    open_trades = get_open_trades(strategy_name)
     
-    # 2. Rule: Max Total Positions
-    if len(open_trades) >= MAX_TOTAL_POSITIONS:
-        return False, f"Portfolio Full ({len(open_trades)}/{MAX_TOTAL_POSITIONS} positions)"
+    # 2. Rule: Max Positions (Per Strategy)
+    if len(open_trades) >= MAX_POSITIONS_PER_STRATEGY:
+        return False, f"Strategy {strategy_name} is Full ({len(open_trades)}/{MAX_POSITIONS_PER_STRATEGY})"
 
-    # 3. Rule: No Duplicates
+    # 3. Rule: No Duplicates (Per Strategy)
+    # (Strategy A can hold RELIANCE, even if Strategy B holds it. But A can't hold it twice.)
     for t in open_trades:
-        if t.ticker == new_candidate:
-            return False, f"Position already OPEN for {new_candidate}"
+        # Dictionary access is safer as get_open_trades returns dicts
+        if t['ticker'] == new_candidate:
+            return False, f"{strategy_name} already holds {new_candidate}"
 
-    # 4. Rule: Sector Exposure
-    print(f"   🧩 Checking Sector Exposure for {new_candidate}...")
+    # 4. Rule: Sector Exposure (Per Strategy)
+    # Note: Frequent YFinance calls can be slow, but we keep your logic here.
+    # We only check sector if we passed the previous checks.
+    print(f"   🧩 {strategy_name}: Checking Sector for {new_candidate}...")
     
     candidate_sector = get_sector(new_candidate)
     
     if candidate_sector == 'Unknown':
-        # If we can't find the sector, we usually allow it but warn
-        print(f"      ⚠️ Sector Unknown for {new_candidate}. Proceeding with caution.")
         return True, "OK (Sector Unknown)"
         
-    # Count how many stocks we already have in this sector
+    # Count existing stocks in this sector for THIS strategy
     same_sector_count = 0
     for t in open_trades:
-        existing_sector = get_sector(t.ticker)
+        existing_sector = get_sector(t['ticker'])
         if existing_sector == candidate_sector:
             same_sector_count += 1
             
-    print(f"      Sector: {candidate_sector} | Current Holdings: {same_sector_count}")
-    
     if same_sector_count >= MAX_SECTOR_EXPOSURE:
-        return False, f"Max exposure reached for {candidate_sector} ({same_sector_count} stocks)"
+        return False, f"Max {candidate_sector} exposure reached for {strategy_name}"
         
     # If all checks pass
     return True, "OK"

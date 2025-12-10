@@ -9,4 +9,5 @@ sqlalchemy
 psycopg2-binary
 python-dotenv
 streamlit
-
+pandas-ta-classic
+upstox-python-sdk

@@ -1,6 +1,7 @@
 import os
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Text
 from sqlalchemy.orm import sessionmaker, declarative_base
+from sqlalchemy import text
 from datetime import datetime
 from .config import DATABASE_URL
 
@@ -23,89 +24,111 @@ class Trade(Base):
     exit_time = Column(DateTime, nullable=True)
     pnl = Column(Float, nullable=True)
     reasoning = Column(Text)
+    # 🆕 NEW COLUMN
+    strategy_name = Column(String, default="MASTER")
+    confidence = Column(Integer, default=0)
 
 class Log(Base):
     __tablename__ = 'app_logs'
     id = Column(Integer, primary_key=True)
     timestamp = Column(DateTime, default=datetime.now)
-    level = Column(String) # INFO, SIGNAL, ERROR
+    level = Column(String)
     message = Column(Text)
 
-# --- FUNCTIONS ---
+class Portfolio(Base):
+    __tablename__ = 'portfolio'
+    # 🆕 Composite Primary Key (id + strategy_name) to allow multiple wallets
+    id = Column(Integer, primary_key=True, autoincrement=True) 
+    strategy_name = Column(String, default="MASTER")
+    balance = Column(Float, default=100000.0)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+# --- INITIALIZATION ---
 def init_db():
     try: Base.metadata.create_all(engine)
     except: pass
     
-    # Init Portfolio if missing
+    # 🆕 Seed the 3 Strategy Wallets if empty
     session = Session()
-    if not session.query(Portfolio).first():
-        session.add(Portfolio(id=1, balance=100000.0))
-        session.commit()
+    strategies = ["STRATEGY_MOMENTUM", "STRATEGY_MEAN_REVERSION", "STRATEGY_AI_SNIPER"]
+    
+    for strat in strategies:
+        exists = session.query(Portfolio).filter_by(strategy_name=strat).first()
+        if not exists:
+            # Create wallet with ₹1 Lakh each
+            session.add(Portfolio(strategy_name=strat, balance=100000.0))
+            print(f"   💰 Created Wallet for {strat}")
+    
+    session.commit()
     session.close()
 
-class Portfolio(Base):
-    __tablename__ = 'portfolio'
-    id = Column(Integer, primary_key=True)
-    balance = Column(Float, default=100000.0)
-    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
-
 # --- CASH MANAGER ---
-def get_current_balance():
+def get_current_balance(strategy_name="MASTER"):
     session = Session()
     try:
-        p = session.query(Portfolio).first()
+        # 🆕 Query by Strategy Name
+        p = session.query(Portfolio).filter_by(strategy_name=strategy_name).first()
         return p.balance if p else 0.0
     finally: session.close()
 
-def update_balance(amount):
+def update_balance(amount, strategy_name="MASTER"):
     session = Session()
     try:
-        p = session.query(Portfolio).first()
-        p.balance += float(amount)
-        session.commit()
-        print(f"   💰 Wallet Updated: ₹{p.balance:,.2f}")
+        # 🆕 Update specific strategy wallet
+        p = session.query(Portfolio).filter_by(strategy_name=strategy_name).first()
+        if p:
+            p.balance += float(amount)
+            session.commit()
+            print(f"   💰 {strategy_name} Wallet Updated: ₹{p.balance:,.2f}")
     except: session.rollback()
     finally: session.close()
 
-# --- LOGGING (SEPARATED) ---
+# --- LOGGING ---
 def log_trade(data, qty):
-    """Saves ONLY actual trades."""
+    """Saves trades with strategy tags."""
     session = Session()
     try:
         new_trade = Trade(
             ticker=str(data['ticker']),
-            signal="BUY", # Only BUYs go here
+            signal=str(data['signal']),
             entry_price=float(data.get('entry_price', 0)),
             target_price=float(data.get('target_price', 0)),
             stop_loss=float(data.get('stop_loss', 0)),
             quantity=int(qty),
             reasoning=str(data.get('reasoning', '')),
-            status="OPEN"
+            status="OPEN",
+            # 🆕 Save Strategy info
+            strategy_name=str(data.get('strategy_name', 'MASTER')),
+            confidence=int(data.get('confidence', 0))
         )
         session.add(new_trade)
         session.commit()
-        print(f"   💾 DB: Trade Opened ({data['ticker']})")
+        print(f"   💾 DB: Trade Opened for {data.get('strategy_name', 'MASTER')}")
     except Exception as e: print(f"   ❌ DB Trade Error: {e}")
     finally: session.close()
 
 def log_signal_audit(ticker, signal, reasoning):
-    """Saves WAIT signals to app_logs, keeping trades table clean."""
     session = Session()
     try:
-        log_entry = Log(
-            level="SIGNAL",
-            message=f"{ticker}: {signal} - {reasoning}"
-        )
+        log_entry = Log(level="SIGNAL", message=f"{ticker}: {signal} - {reasoning}")
         session.add(log_entry)
         session.commit()
-        print(f"   🗂️ Audit Log: {ticker} -> {signal}")
     except: pass
     finally: session.close()
 
 # --- TRADE MANAGEMENT ---
-def get_open_trades():
+def get_open_trades(strategy_name=None):
+    """
+    Fetches open trades.
+    If strategy_name is provided, filters for that strategy.
+    If None, returns ALL open trades (useful for dashboard).
+    """
     session = Session()
-    try: return session.query(Trade).filter(Trade.status == 'OPEN').all()
+    try: 
+        query = session.query(Trade).filter(Trade.status == 'OPEN')
+        if strategy_name:
+            query = query.filter(Trade.strategy_name == strategy_name)
+        return query.all()
     finally: session.close()
 
 def update_trade_status(trade_id, status, exit_price, pnl):
@@ -116,7 +139,6 @@ def update_trade_status(trade_id, status, exit_price, pnl):
             t.status = status
             t.exit_time = datetime.now()
             t.pnl = pnl
-            # We don't have an exit_price column, but PnL captures the math
             session.commit()
             print(f"   🔒 Trade Closed. PnL: {pnl}")
     except: session.rollback()

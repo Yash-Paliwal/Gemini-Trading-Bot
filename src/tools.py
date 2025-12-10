@@ -5,6 +5,9 @@ import io
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from html import unescape
+import yfinance as yf  # <--- NEW IMPORT
+import pandas as pd    # <--- NEW IMPORT
+
 from .config import UPSTOX_ACCESS_TOKEN, INDIANAPI_KEY
 from .models import PriceCandle, FundamentalSnapshot, NewsItem
 from .upstox_client import upstox_client
@@ -25,23 +28,18 @@ def fetch_upstox_map():
         return m
     except: return {}
 
-# --- 2. LIVE PRICE (DEBUG MODE ENABLED) ---
+# --- 2. LIVE PRICE (DEBUG MODE) ---
 def get_live_price(instrument_key: str, symbol_fallback: str = None):
     session = upstox_client.get_session()
-    url = "https://api.upstox.com/v2/market-quote/ltp" # Using V2 for stability if V3 fails, or swap to V3
-    # Note: Upstox documentation says V2 LTP is still widely supported. 
-    # If you want V3 specifically: url = "https://api.upstox.com/v3/market-quote/ltp"
-    
-    # Let's force V3 as per your previous request
+    # Force V3 as requested
     url = "https://api.upstox.com/v3/market-quote/ltp" 
     
     def try_key(k):
         try:
             res = session.get(url, params={"instrument_key": k})
-            
-            # 🚨 DEBUG PRINT: Only shows if status is NOT 200
             if res.status_code != 200:
-                print(f"      ❌ API FAIL ({k}): {res.status_code} - {res.text}")
+                # Debug print only on failure to keep logs clean
+                # print(f"      ❌ API FAIL ({k}): {res.status_code}")
                 return None
                 
             d = res.json()
@@ -49,7 +47,6 @@ def get_live_price(instrument_key: str, symbol_fallback: str = None):
                 first = next(iter(d['data']))
                 return float(d['data'][first]['last_price'])
         except Exception as e: 
-            print(f"      ❌ EXCEPTION ({k}): {e}")
             return None
         return None
 
@@ -64,7 +61,7 @@ def get_live_price(instrument_key: str, symbol_fallback: str = None):
         
     return None
 
-# --- 3. HISTORICAL DATA ---
+# --- 3. UPSTOX HISTORICAL DATA (For specialized needs) ---
 def fetch_candles(key, days, interval="days"):
     session = upstox_client.get_session()
     start = datetime.now().date() - timedelta(days=days)
@@ -91,3 +88,31 @@ def fetch_news(name):
         root = ET.fromstring(requests.get(url).content)
         return [NewsItem(title=unescape(i.find('title').text), source=i.find('source').text) for i in root.findall('./channel/item')[:3]]
     except: return []
+
+# --- 6. GENERIC DATA FETCH (For Strategies) ---
+# 🚨 THIS WAS MISSING
+def fetch_data(ticker, period="1y", interval="1d"):
+    """
+    Robust wrapper for yfinance to fetch OHLCV data.
+    Automatically handles the '.NS' suffix for Indian stocks.
+    """
+    try:
+        # Ensure ticker has .NS suffix for Yahoo Finance
+        sym = ticker if ticker.endswith(".NS") else f"{ticker}.NS"
+        
+        # Download data
+        df = yf.download(sym, period=period, interval=interval, progress=False)
+        
+        if df.empty:
+            print(f"      ⚠️ No data found for {sym}")
+            return None
+            
+        # Standardize Columns (Remove MultiIndex if present)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+            
+        return df
+        
+    except Exception as e:
+        print(f"      ❌ Data Fetch Error ({ticker}): {e}")
+        return None
