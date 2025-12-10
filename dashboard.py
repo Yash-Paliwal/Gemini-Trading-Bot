@@ -2,230 +2,200 @@ import os
 import time
 import streamlit as st
 import pandas as pd
-import streamlit.components.v1 as components
 import altair as alt
-from sqlalchemy import create_engine, text
-import socket
 
-# --- 1. CRITICAL SETUP: LOAD SECRETS BEFORE IMPORTS ---
-st.set_page_config(page_title="Gemini Hedge Fund", layout="wide", page_icon="📈")
-
-# Load Secrets into Environment
-try:
-    if "DATABASE_URL" in st.secrets:
-        os.environ["DATABASE_URL"] = st.secrets["DATABASE_URL"]
-    if "UPSTOX_API_KEY" in st.secrets:
-        os.environ["UPSTOX_API_KEY"] = st.secrets["UPSTOX_API_KEY"]
-    if "UPSTOX_API_SECRET" in st.secrets:
-        os.environ["UPSTOX_API_SECRET"] = st.secrets["UPSTOX_API_SECRET"]
-    if "REDIRECT_URI" in st.secrets:
-        os.environ["REDIRECT_URI"] = st.secrets["REDIRECT_URI"]
-except FileNotFoundError:
-    pass
-
-# --- 2. NOW IMPORT MODULES ---
+# --- IMPORTS ---
 from src.upstox_client import upstox_client
-from src.tools import get_live_price, fetch_upstox_map
 from src.dashboard_modules.auth import get_login_url, exchange_code_for_token
 from src.dashboard_modules.data import get_db_engine, fetch_dashboard_data, save_token_to_db
+from src.dashboard_modules.analytics import calculate_strategy_performance
+from src.dashboard_modules.charts import render_allocation_donut, render_portfolio_growth_chart, render_tradingview_widget
+from src.dashboard_modules.env import load_config
 
-# Custom CSS
+# --- CONFIG & STYLING ---
+st.set_page_config(page_title="Gemini Fund", layout="wide", page_icon="🏛️")
 st.markdown("""
 <style>
-    [data-testid="stMetricValue"] { font-size: 1.8rem; font-weight: bold; }
-    .stDataFrame { border-radius: 10px; overflow: hidden; }
-    .positive { color: #4CAF50; font-weight: bold; }
-    .negative { color: #FF5252; font-weight: bold; }
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+    html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
+    
+    /* Global Text Colors for Dark Mode */
+    h1, h2, h3, h4, h5, p, span, div { color: #E0E0E0; }
+    
+    /* Metrics Box - Dark Theme Friendly */
+    [data-testid="stMetric"] {
+        background-color: #1E1E1E; /* Dark Gray */
+        padding: 15px;
+        border-radius: 10px;
+        border: 1px solid #333;
+    }
+    [data-testid="stMetricValue"] { font-size: 1.8rem !important; color: #FFFFFF !important; }
+    [data-testid="stMetricLabel"] { color: #888888 !important; }
+    
+    /* Custom Classes */
+    .profit-pos { color: #00C805; font-weight: 700; }
+    .profit-neg { color: #FF5000; font-weight: 700; }
+    
+    .strat-card {
+        background-color: #1E1E1E;
+        padding: 15px;
+        border-radius: 12px;
+        border: 1px solid #333;
+        margin-bottom: 10px;
+    }
 </style>
 """, unsafe_allow_html=True)
 
-# Check Config
-if not os.getenv("DATABASE_URL"):
-    st.error("❌ Database URL missing! Check your .env or Secrets.")
+# Setup
+config = load_config()
+if not config.get("DATABASE_URL"): st.error("❌ DB URL missing!"); st.stop()
+engine = get_db_engine(config["DATABASE_URL"])
+
+# --- SIDEBAR ---
+with st.sidebar:
+    st.markdown("### ⚡ Gemini Fund Admin")
+    is_live = upstox_client.fetch_token_from_db()
+    
+    if is_live: st.success("🟢 System Online")
+    else: st.error("🔴 System Offline")
+
+    if config.get("UPSTOX_API_KEY") and not is_live:
+        st.link_button("Login to Upstox", get_login_url(config.get("UPSTOX_API_KEY"), config.get("REDIRECT_URI")), type="primary")
+
+    if "code" in st.query_params:
+        if st.button("Complete Auth"):
+            ok, msg = exchange_code_for_token(st.query_params["code"], config.get("UPSTOX_API_KEY"), config.get("UPSTOX_API_SECRET"), config.get("REDIRECT_URI"))
+            if ok: save_token_to_db(engine, msg); st.rerun()
+            else: st.error(msg)
+            
+    if st.button("↻ Refresh Data"): st.rerun()
+
+# --- MAIN LOGIC ---
+st.title("🏛️ Gemini AI Hedge Fund")
+
+# 1. Fetch & Calculate
+trades, portfolio = fetch_dashboard_data(engine)
+df_stats, total_equity, total_cash = calculate_strategy_performance(trades, portfolio, is_live)
+
+# 2. Global Fund Header
+total_pnl = df_stats['Realized P&L'].sum() + df_stats['Unrealized P&L'].sum() if not df_stats.empty else 0
+pnl_color = "profit-pos" if total_pnl >= 0 else "profit-neg"
+pnl_sign = "+" if total_pnl >= 0 else ""
+
+c1, c2, c3 = st.columns(3)
+c1.metric("🏦 Fund AUM", f"₹{total_equity:,.0f}")
+c2.metric("💵 Total Cash", f"₹{total_cash:,.0f}")
+c3.markdown(f"""
+<div style="background-color:#1E1E1E; padding:15px; border-radius:10px; border:1px solid #333;">
+    <span style="font-size:0.9rem; color:#888;">Net P&L</span><br>
+    <span style="font-size:1.8rem; color:#FFF; font-weight:700;">₹{total_pnl:,.0f}</span><br>
+    <span class="{pnl_color}">{pnl_sign}{(total_pnl/100000)*100:.2f}% All Time</span>
+</div>
+""", unsafe_allow_html=True)
+
+st.divider()
+
+if df_stats.empty:
+    st.info("No strategy data found. Waiting for first trade.")
     st.stop()
 
-engine = get_db_engine(os.getenv("DATABASE_URL"))
+# 3. STRATEGY TABS (Master / Detail View)
+tab_names = ["🏆 Overview"] + df_stats['Strategy'].tolist()
+tabs = st.tabs(tab_names)
 
-# --- 3. HELPER: CHARTS ---
-def render_tradingview_chart(symbol):
-    clean_symbol = symbol.replace(".NS", "")
-    tv_symbol = f"BSE:{clean_symbol}"
-    html_code = f"""
-    <div class="tradingview-widget-container">
-      <div id="tradingview_{clean_symbol}"></div>
-      <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
-      <script type="text/javascript">
-      new TradingView.widget({{
-        "width": "100%", "height": 400, "symbol": "{tv_symbol}", "interval": "D",
-        "timezone": "Asia/Kolkata", "theme": "light", "style": "1", "locale": "in",
-        "toolbar_bg": "#f1f3f6", "enable_publishing": false, "allow_symbol_change": true,
-        "container_id": "tradingview_{clean_symbol}"
-      }});
-      </script>
-    </div>
-    """
-    components.html(html_code, height=400)
-
-# --- 4. SIDEBAR: LOGIN ---
-with st.sidebar:
-    st.header("🔐 Daily Login")
+# --- TAB 1: OVERVIEW LEADERBOARD ---
+with tabs[0]:
+    st.markdown("#### Strategy Performance")
     
-    # Check Live Status
-    is_live = upstox_client.fetch_token_from_db()
-    if is_live:
-        st.success("🟢 Live Data: Connected")
-    else:
-        st.error("🔴 Live Data: Disconnected")
-
-    # Smart Redirect Logic
-    configured_uri = os.getenv("REDIRECT_URI", "")
-    if "localhost" in socket.gethostname() or "127.0.0.1" in socket.gethostbyname(socket.gethostname()):
-        final_redirect_uri = "http://localhost:8501"
-    else:
-        final_redirect_uri = configured_uri or "https://gemini-trading-bot-yash.streamlit.app"
+    # 3-Column Grid for Strategies
+    cols = st.columns(3)
+    for i, row in df_stats.iterrows():
+        col_idx = i % 3
+        with cols[col_idx]:
+            # Strategy Card
+            with st.container():
+                st.markdown(f"""
+                <div class="strat-card">
+                    <div style="font-size:1.1rem; font-weight:700; margin-bottom:5px;">{row['Strategy']}</div>
+                    <div style="color:#888; font-size:0.85rem;">Equity: <span style="color:#FFF;">₹{row['Total Equity']:,.0f}</span></div>
+                    <div style="color:#888; font-size:0.85rem;">Cash: <span style="color:#FFF;">₹{row['Cash']:,.0f}</span></div>
+                </div>
+                """, unsafe_allow_html=True)
+                
+                # Visuals below card
+                c_chart, c_pnl = st.columns([1, 1])
+                with c_chart: render_allocation_donut(row['Cash'], row['Total Equity'])
+                with c_pnl: 
+                    s_pnl = row['Realized P&L'] + row['Unrealized P&L']
+                    s_col = "profit-pos" if s_pnl >= 0 else "profit-neg"
+                    st.markdown(f"<div style='text-align:center; padding-top:30px;'><span class='{s_col}' style='font-size:1.4rem;'>{'+' if s_pnl>=0 else ''}₹{s_pnl:,.0f}</span><br><span style='color:#666;'>Net P&L</span></div>", unsafe_allow_html=True)
     
-    st.caption(f"Redirect: `{final_redirect_uri}`")
-    
-    api_key = os.getenv("UPSTOX_API_KEY")
-    api_secret = os.getenv("UPSTOX_API_SECRET")
-    
-    if api_key and api_secret:
-        st.link_button("Login to Upstox 🚀", get_login_url(api_key, final_redirect_uri), type="primary")
-        
-        if auth_code := st.query_params.get("code"):
-            if st.button("Generate Token 🔑"):
-                with st.spinner("Authorizing..."):
-                    # 🚨 FIX: Call with 4 args, then save token manually
-                    success, msg_or_token = exchange_code_for_token(auth_code, api_key, api_secret, final_redirect_uri)
-                    
-                    if success:
-                        # Success = msg_or_token is the actual token string
-                        save_token_to_db(engine, msg_or_token)
-                        st.success("✅ System Armed.")
-                        time.sleep(1)
-                        st.query_params.clear()
-                        st.rerun()
-                    else:
-                        # Failure = msg_or_token is the error message
-                        st.error(f"❌ {msg_or_token}")
-    
-    st.divider()
-    if st.button('🔄 Refresh Dashboard'): st.rerun()
-    st.caption(f"Last Update: {time.strftime('%H:%M:%S')}")
+    st.markdown("#### 📈 Portfolio Growth")
+    render_portfolio_growth_chart(df_stats)
 
-# --- 5. MAIN LOGIC ---
-st.title("🤖 Gemini AI Hedge Fund")
 
-try: trades, portfolio = fetch_dashboard_data(engine)
-except Exception as e: st.error(f"DB Error: {e}"); st.stop()
+# --- TABS 2...N: DEEP DIVE ---
+for i, strat_name in enumerate(df_stats['Strategy']):
+    with tabs[i + 1]:
+        strat_row = df_stats[df_stats['Strategy'] == strat_name].iloc[0]
+        strat_db_name = f"STRATEGY_{strat_name}"
+        strat_trades = trades[trades['strategy_name'] == strat_db_name]
+        strat_open = strat_trades[strat_trades['status'] == 'OPEN'].copy()
 
-# Sum all strategy balances to get Total Fund Cash
-cash = portfolio['balance'].sum() if not portfolio.empty else 0.0
-open_trades = trades[trades['status'] == 'OPEN'].copy()
-
-# Initialize Defaults
-total_invested = 0
-total_unrealized_pnl = 0
-current_holdings_value = 0
-
-if not open_trades.empty:
-    open_trades['Live Price'] = open_trades['entry_price']
-    open_trades['PnL'] = 0.0
-    open_trades['PnL %'] = 0.0
-    
-    # Re-Check Token for Main Logic
-    is_live = upstox_client.fetch_token_from_db()
-    
-    if is_live:
-        master_map = fetch_upstox_map()
-        live_prices, pnls, vals = [], [], []
-        
-        for _, row in open_trades.iterrows():
-            curr = row['entry_price']
-            key = master_map.get(row['ticker'])
-            if key:
-                lp = get_live_price(key, row['ticker'])
-                if lp: curr = lp
-            
-            val = curr * row['quantity']
-            pnl = val - (row['entry_price'] * row['quantity'])
-            
-            live_prices.append(curr)
-            vals.append(val)
-            pnls.append(pnl)
-        
-        open_trades['Live Price'] = live_prices
-        open_trades['Current Value'] = vals
-        open_trades['PnL'] = pnls
-        open_trades['PnL %'] = ((open_trades['Live Price'] - open_trades['entry_price']) / open_trades['entry_price']) * 100
-        
-        total_invested = (open_trades['entry_price'] * open_trades['quantity']).sum()
-        current_holdings_value = sum(vals)
-        total_unrealized_pnl = sum(pnls)
-    else:
-        st.warning("⚠️ Showing cached data. Please Login in Sidebar to see Live P&L.")
-        total_invested = (open_trades['entry_price'] * open_trades['quantity']).sum()
-        current_holdings_value = total_invested
-
-# Metrics
-net_worth = cash + current_holdings_value
-closed = trades[trades['status'].str.contains('CLOSED|HIT', na=False)]
-realized_pnl = closed['pnl'].sum() if not closed.empty else 0
-total_pnl = realized_pnl + total_unrealized_pnl
-
-# Display Top Row
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("🏛️ Net Worth", f"₹{net_worth:,.0f}", delta=f"{total_unrealized_pnl:+.0f} (Open)")
-m2.metric("💵 Liquid Cash", f"₹{cash:,.0f}")
-m3.metric("🛡️ Invested", f"₹{current_holdings_value:,.0f}")
-m4.metric("💰 Total Lifetime Profit", f"₹{total_pnl:,.0f}", delta=f"Realized: {realized_pnl:.0f}")
-
-# Tabs
-t1, t2, t3 = st.tabs(["⚡ Active Trades", "📊 Analytics", "📜 Ledger"])
-
-with t1:
-    st.subheader("🟢 Live Positions")
-    if not open_trades.empty:
-        def color_pnl(val):
-            color = '#d4edda' if val > 0 else '#f8d7da' if val < 0 else ''
-            text_color = 'green' if val > 0 else 'red' if val < 0 else 'black'
-            return f'background-color: {color}; color: {text_color}'
-
-        styled_df = open_trades[['ticker', 'quantity', 'entry_price', 'Live Price', 'target_price', 'stop_loss', 'PnL', 'PnL %']].style\
-            .format({'entry_price': '₹{:.2f}', 'Live Price': '₹{:.2f}', 'target_price': '₹{:.2f}', 'stop_loss': '₹{:.2f}', 'PnL': '₹{:.2f}', 'PnL %': '{:.2f}%'})\
-            .map(color_pnl, subset=['PnL', 'PnL %'])
-
-        st.dataframe(styled_df, use_container_width=True)
+        # Header Stats
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Buying Power", f"₹{strat_row['Cash']:,.0f}")
+        k2.metric("Invested", f"₹{strat_row['Invested']:,.0f}")
+        k3.metric("Realized P&L", f"₹{strat_row['Realized P&L']:,.0f}")
+        k4.metric("Unrealized P&L", f"₹{strat_row['Unrealized P&L']:,.0f}")
         
         st.divider()
-        st.caption("Click tabs below to view charts")
-        tabs = st.tabs(open_trades['ticker'].tolist())
-        for i, tab in enumerate(tabs):
-            with tab:
-                row = open_trades.iloc[i]
-                c1, c2 = st.columns([3, 1])
-                with c1: render_tradingview_chart(row['ticker'])
-                with c2: 
-                    st.info(f"**AI Logic:**\n\n{row['reasoning']}")
-                    st.metric("Target", f"₹{row['target_price']}")
-                    st.metric("Stop", f"₹{row['stop_loss']}")
-    else: st.info("No active trades.")
 
-with t2:
-    c1, c2 = st.columns(2)
-    with c1:
-        st.subheader("Performance Curve")
-        if not closed.empty:
-            chart = closed.sort_values('exit_time').copy()
-            chart['cum_pnl'] = chart['pnl'].cumsum()
-            st.line_chart(chart, x='exit_time', y='cum_pnl')
-        else: st.caption("No closed trades yet.")
-    with c2:
-        st.subheader("Asset Allocation")
-        if net_worth > 0:
-            df = pd.DataFrame({'Asset': ['Cash', 'Stocks'], 'Value': [cash, max(current_holdings_value, 0)]})
-            st.altair_chart(alt.Chart(df).mark_arc(innerRadius=50).encode(theta="Value", color="Asset"), use_container_width=True)
+        col_holdings, col_charts = st.columns([1.5, 2.5])
+        
+        with col_holdings:
+            st.markdown("#### 📦 Current Holdings")
+            if not strat_open.empty:
+                display_df = strat_open[['ticker', 'quantity', 'entry_price']].copy()
+                st.dataframe(
+                    display_df,
+                    column_config={
+                        "ticker": "Symbol",
+                        "quantity": "Qty",
+                        "entry_price": st.column_config.NumberColumn("Avg Cost", format="₹%.2f"),
+                    },
+                    use_container_width=True,
+                    hide_index=True
+                )
+            else:
+                st.info("No open positions. Strategy is hunting...")
+                
+            st.markdown("#### 📜 Recent Trades")
+            history = strat_trades[strat_trades['status'] != 'OPEN'].sort_values('entry_time', ascending=False).head(10)
+            if not history.empty:
+                st.dataframe(history[['ticker', 'signal', 'pnl']], use_container_width=True, hide_index=True)
+            else:
+                st.caption("No trade history yet.")
 
-with t3:
-    st.subheader("📜 Trade History")
-    st.dataframe(trades, use_container_width=True)
+        with col_charts:
+            st.markdown("#### 📉 Market Vision")
+            
+            # Smart Select Logic
+            chart_ticker = None
+            if not strat_open.empty:
+                chart_ticker = strat_open.iloc[0]['ticker']
+                
+            # Dropdown Override
+            all_tickers = list(set(strat_open['ticker'].tolist() + history['ticker'].tolist())) if not history.empty else strat_open['ticker'].tolist()
+            
+            if all_tickers:
+                selected_ticker = st.selectbox(f"Analyze Stock ({strat_name})", all_tickers, index=0 if chart_ticker else 0)
+                render_tradingview_widget(selected_ticker)
+                
+                # Show AI Reasoning if available
+                if not strat_open.empty and selected_ticker in strat_open['ticker'].values:
+                     details = strat_open[strat_open['ticker'] == selected_ticker].iloc[0]
+                     with st.expander("🤖 AI Logic Analysis", expanded=True):
+                         st.write(details.get('reasoning', 'No deep analysis logged.'))
+            else:
+                st.info("Waiting for data to generate charts...")
