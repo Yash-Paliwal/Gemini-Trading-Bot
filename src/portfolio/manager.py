@@ -35,8 +35,8 @@ def check_portfolio_health(new_candidate, strategy_name):
     # 3. Rule: No Duplicates (Per Strategy)
     # (Strategy A can hold RELIANCE, even if Strategy B holds it. But A can't hold it twice.)
     for t in open_trades:
-        # Dictionary access is safer as get_open_trades returns dicts
-        if t['ticker'] == new_candidate:
+        # get_open_trades returns ORM Trade objects, so use attribute access
+        if t.ticker == new_candidate:
             return False, f"{strategy_name} already holds {new_candidate}"
 
     # 4. Rule: Sector Exposure (Per Strategy)
@@ -52,7 +52,7 @@ def check_portfolio_health(new_candidate, strategy_name):
     # Count existing stocks in this sector for THIS strategy
     same_sector_count = 0
     for t in open_trades:
-        existing_sector = get_sector(t['ticker'])
+        existing_sector = get_sector(t.ticker)
         if existing_sector == candidate_sector:
             same_sector_count += 1
             

@@ -63,14 +63,55 @@ def get_live_price(instrument_key: str, symbol_fallback: str = None):
 
 # --- 3. UPSTOX HISTORICAL DATA (For specialized needs) ---
 def fetch_candles(key, days, interval="days"):
+    """
+    Wrapper around Upstox Historical Candle Data V3.
+    Docs: https://upstox.com/developer/api-documentation/v3/get-historical-candle-data
+
+    URL pattern:
+      /v3/historical-candle/{instrument_key}/{unit}/{interval}/{to_date}/{from_date}
+
+    For daily data:
+      unit = "days", interval = "1"
+      to_date = today, from_date = today - days
+    """
     session = upstox_client.get_session()
-    start = datetime.now().date() - timedelta(days=days)
-    url = f"https://api.upstox.com/v3/historical-candle/{key}/{interval}/1/{datetime.now().date()}/{start}"
+
+    # Upstox expects to_date first, then from_date (both YYYY-MM-DD)
+    to_date = datetime.now().date()
+    from_date = to_date - timedelta(days=days)
+
+    unit = interval  # keep backwards compatibility with existing calls
+    url = f"https://api.upstox.com/v3/historical-candle/{key}/{unit}/1/{to_date}/{from_date}"
+
     try:
-        res = session.get(url).json()
-        c = res.get('data', {}).get('candles', [])
-        return sorted([PriceCandle(timestamp=datetime.fromisoformat(i[0].replace('Z','+00:00')), open=i[1], high=i[2], low=i[3], close=i[4], volume=i[5], ticker=key) for i in c], key=lambda x: x.timestamp) if c else []
-    except: return []
+        res = session.get(url)
+        if res.status_code != 200:
+            # Return empty on failure; caller will log/handle
+            # print(f"⚠️ Upstox candle API error {res.status_code} for {key}: {res.text}")
+            return []
+
+        data = res.json()
+        candles = data.get("data", {}).get("candles", [])
+        if not candles:
+            return []
+
+        return sorted(
+            [
+                PriceCandle(
+                    timestamp=datetime.fromisoformat(row[0].replace("Z", "+00:00")),
+                    open=row[1],
+                    high=row[2],
+                    low=row[3],
+                    close=row[4],
+                    volume=row[5],
+                    ticker=key,
+                )
+                for row in candles
+            ],
+            key=lambda x: x.timestamp,
+        )
+    except Exception:
+        return []
 
 # --- 4. FUNDAMENTALS ---
 def fetch_funds(name):

@@ -12,6 +12,9 @@ def run_diagnostics():
     print("🏥 GEMINI BOT DIAGNOSTICS TOOL 🏥")
     print("====================================")
 
+    # Ensure key is always defined, even if mapping fails later
+    key = None
+
     # TEST 1: Database Structure
     print("\n[1/5] Checking Database Schema...")
     try:
@@ -80,6 +83,7 @@ def run_diagnostics():
             print("   ❌ Authentication FAILED. Please login via Dashboard first.")
             key = None
 
+    # Only attempt price fetch if both auth and mapping succeeded
     if upstox_client.check_connection() and key:
         try:
             price = get_live_price(key, "RELIANCE.NS")

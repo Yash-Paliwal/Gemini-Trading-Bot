@@ -23,6 +23,8 @@ class Trade(Base):
     entry_time = Column(DateTime, default=datetime.now)
     exit_time = Column(DateTime, nullable=True)
     pnl = Column(Float, nullable=True)
+    # Track last update time for manual SQL updates (e.g. averaging/pyramiding)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
     reasoning = Column(Text)
     # 🆕 NEW COLUMN
     strategy_name = Column(String, default="MASTER")
